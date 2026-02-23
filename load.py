@@ -85,8 +85,9 @@ def fetch_openmeteo_weather(start_date, end_date, lat, lon):
         "longitude": lon,
         "start_date": start_str,
         "end_date": end_str,
-        # Map variables to match Meteostat: Temp, Dew Point, Wind Speed
-        "hourly": ["temperature_2m", "dew_point_2m", "wind_speed_10m"],
+        # Map variables to match Meteostat: Temp, Relative Humidity, Dew Point, Wind Speed
+        "hourly": ["temperature_2m", "relative_humidity_2m",
+                   "dew_point_2m", "wind_speed_10m"],
         "timezone": "America/New_York" # Handles DST automatically
     }
 
@@ -107,8 +108,9 @@ def fetch_openmeteo_weather(start_date, end_date, lat, lon):
 
     hourly_data = {
         "temp": hourly.Variables(0).ValuesAsNumpy(),       # temperature_2m
-        "dwpt": hourly.Variables(1).ValuesAsNumpy(),       # dew_point_2m
-        "wspd": hourly.Variables(2).ValuesAsNumpy()        # wind_speed_10m
+        "rh": hourly.Variables(1).ValuesAsNumpy(),         # relative_humidity_2m
+        "dwpt": hourly.Variables(2).ValuesAsNumpy(),       # dew_point_2m
+        "wspd": hourly.Variables(3).ValuesAsNumpy()        # wind_speed_10m
     }
 
     weather_df = pd.DataFrame(data = hourly_data, index=date_range)
@@ -126,31 +128,38 @@ def fetch_openmeteo_weather(start_date, end_date, lat, lon):
     print(f"Fetched {len(weather_df)} weather rows (Open-Meteo).")
     return weather_df
 
-def create_dataset(pjm_filepath, target_zone, airport_lat, airport_lon, weather_source='openmeteo'):
+def create_dataset(pjm_filepath, target_zone, locations, weather_source='openmeteo'):
     """
-    Master function to load PJM, load Weather, and join them.
-    
+    Master function to load PJM, load Weather for one or more locations, and join them.
+
     Args:
-        weather_source (str): 'meteostat' (default) or 'openmeteo'
+        locations: A list of (name, lat, lon) tuples identifying weather stations.
+                   Example: [("Philadelphia", 39.95, -75.16), ("Harrisburg", 40.27, -76.88)]
+                   Each location's weather columns are prefixed with its name, e.g. "philadelphia_temp".
+        weather_source (str): 'openmeteo' (default) or 'meteostat'
     """
     # 1. Load Grid Data
     df_load = load_pjm_csv(pjm_filepath, target_zone)
-    
+
     if df_load.empty:
         raise ValueError(f"No data found for zone {target_zone}. Check your CSV or zone name.")
 
     # 2. Determine date range
     start_date = df_load.index.min()
     end_date = df_load.index.max()
-    
-    # 3. Load Weather Data based on selection
-    if weather_source == 'openmeteo':
-        df_weather = fetch_openmeteo_weather(start_date, end_date, airport_lat, airport_lon)
-    else:
-        df_weather = fetch_noaa_weather(start_date, end_date, airport_lat, airport_lon)
-    
-    # 4. Merge
-    # Inner join ensures we only keep rows where we have BOTH load and weather
-    df_final = df_load.join(df_weather, how='inner')
-    
+
+    # 3. Load Weather Data for each location and prefix columns
+    fetch_fn = fetch_openmeteo_weather if weather_source == 'openmeteo' else fetch_noaa_weather
+
+    weather_frames = []
+    for name, lat, lon in locations:
+        df_w = fetch_fn(start_date, end_date, lat, lon)
+        prefix = name.lower().replace(" ", "_")
+        df_w = df_w.add_prefix(f"{prefix}_")
+        weather_frames.append(df_w)
+
+    # 4. Merge all weather frames, then join with load
+    df_weather_all = weather_frames[0].join(weather_frames[1:], how='inner') if len(weather_frames) > 1 else weather_frames[0]
+    df_final = df_load.join(df_weather_all, how='inner')
+
     return df_final

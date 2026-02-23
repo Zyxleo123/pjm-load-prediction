@@ -1,9 +1,12 @@
 import pandas as pd
+import os
 from datetime import datetime, timedelta
 from meteostat import Point, Hourly
 import openmeteo_requests
 import requests_cache
 from retry_requests import retry
+
+DATA_ROOT = "data"
 
 def load_pjm_csv(filepath, target_zone='PE'):
     """
@@ -12,7 +15,7 @@ def load_pjm_csv(filepath, target_zone='PE'):
     print(f"Loading PJM data from {filepath}...")
     
     # Load the CSV
-    df = pd.read_csv(filepath)
+    df = pd.read_csv(os.path.join(DATA_ROOT, 'raw', filepath))
     
     # 1. Filter for the specific Zone (The "Pipe Owner")
     if 'zone' in df.columns:
@@ -152,7 +155,8 @@ def create_dataset(pjm_filepath, target_zone, locations, weather_source='openmet
     fetch_fn = fetch_openmeteo_weather if weather_source == 'openmeteo' else fetch_noaa_weather
 
     weather_frames = []
-    for name, lat, lon in locations:
+    for name, latlon in locations.items():
+        lat, lon = latlon
         df_w = fetch_fn(start_date, end_date, lat, lon)
         prefix = name.lower().replace(" ", "_")
         df_w = df_w.add_prefix(f"{prefix}_")

@@ -27,7 +27,7 @@ class NaiveMLR:
 
     Wraps sklearn LinearRegression with the feature engineering from
     ``features.build_features()``.  When recency features are enabled
-    (``features['temp_lags']`` or ``features['temp_mavg']``), the model
+    (``features['weather_lags']`` or ``features['weather_mavg']``), the model
     automatically stores the tail of the training data and prepends it when
     predicting, so that lag/moving-average features can be computed for all
     test rows without a warm-up gap.
@@ -38,21 +38,21 @@ class NaiveMLR:
         Feature group → bool mapping passed to ``build_features()``.
         Missing keys fall back to ``DEFAULT_FEATURES``.  Example::
 
-            NaiveMLR(features={"temp_lags": True, "temp_mavg": True})
+            NaiveMLR(features={"weather_lags": True, "weather_mavg": True})
 
     n_lags : int, optional
-        Number of lagged hourly temperature variables (Wang et al. 2016).
-        Default 72.
+        Number of lagged hourly weather variables (Wang et al. 2016).
+        Default 12.
     n_mavg_days : int, optional
-        Number of daily moving-average temperature variables (Wang et al.
-        2016).  Default 7.
+        Number of daily moving-average weather variables (Wang et al.
+        2016).  Default 2.
 
     Usage
     -----
-    model = NaiveMLR()                          # base 281-feature model
-    model = NaiveMLR(features={"temp_lags": True}, n_lags=4)
-    model = NaiveMLR(features={"temp_mavg": True}, n_mavg_days=2)
-    model = NaiveMLR(features={"temp_lags": True, "temp_mavg": True},
+    model = NaiveMLR()                             # base features only
+    model = NaiveMLR(features={"weather_lags": True}, n_lags=4)
+    model = NaiveMLR(features={"weather_mavg": True}, n_mavg_days=2)
+    model = NaiveMLR(features={"weather_lags": True, "weather_mavg": True},
                      n_lags=4, n_mavg_days=2)
 
     preds = model.fit_predict(df_train, df_test)
@@ -61,8 +61,8 @@ class NaiveMLR:
     def __init__(
         self,
         features: Optional[Dict[str, bool]] = None,
-        n_lags: int = 72,
-        n_mavg_days: int = 7,
+        n_lags: int = 12,
+        n_mavg_days: int = 2,
     ) -> None:
         self._features    = features
         self._n_lags      = n_lags
@@ -98,8 +98,8 @@ class NaiveMLR:
         if self._features is not None:
             feat.update({k: v for k, v in self._features.items()
                          if k in DEFAULT_FEATURES})
-        lags_rows = self._n_lags if feat["temp_lags"] else 0
-        mavg_rows = (24 * self._n_mavg_days + 1) if feat["temp_mavg"] else 0
+        lags_rows = self._n_lags if feat["weather_lags"] else 0
+        mavg_rows = (24 * self._n_mavg_days + 1) if feat["weather_mavg"] else 0
         return max(lags_rows, mavg_rows)
 
     # ------------------------------------------------------------------
@@ -113,7 +113,8 @@ class NaiveMLR:
         Parameters
         ----------
         df_train : pd.DataFrame
-            Training data with DatetimeIndex, ``'load_mw'``, and ``'temp'``.
+            Training data with DatetimeIndex, ``'load_mw'``, and one or more
+            weather columns (e.g. ``'temp'``, ``'philadelphia_temp'``, ``'rh'``).
 
         Returns
         -------
@@ -135,7 +136,9 @@ class NaiveMLR:
         # Store training tail for recency warm-up during predict()
         lookback = self._lookback_rows()
         if lookback > 0:
-            self._train_tail = df_train[["load_mw", "temp"]].tail(lookback).copy()
+            weather_cols = [c for c in df_train.columns if c != "load_mw"]
+            keep_cols = ["load_mw"] + weather_cols
+            self._train_tail = df_train[keep_cols].tail(lookback).copy()
 
         return self
 
@@ -150,8 +153,8 @@ class NaiveMLR:
         Parameters
         ----------
         df_test : pd.DataFrame
-            Test/forecast data with DatetimeIndex and ``'temp'`` column.
-            ``'load_mw'`` is not required.
+            Test/forecast data with DatetimeIndex and the same weather columns
+            used during training.  ``'load_mw'`` is not required.
         trend_offset : int, optional
             Override for the trend counter start.  Defaults to the last
             trend value from training (set by ``fit()``), so the test
@@ -224,101 +227,6 @@ class NaiveMLR:
         """
         self.fit(df_train)
         return self.predict(df_test)
-
-
-# ---------------------------------------------------------------------------
-# Rolling forecast
-# ---------------------------------------------------------------------------
-
-def rolling_forecast(
-    df: pd.DataFrame,
-    forecast_start: pd.Timestamp,
-    forecast_end: pd.Timestamp,
-    min_train_days: int = 30,
-    model: Optional[NaiveMLR] = None,
-) -> pd.DataFrame:
-    """
-    Rolling daily retrain-and-forecast loop.
-
-    For each calendar day d in [forecast_start, forecast_end]:
-      1. Training set = all rows where timestamp < midnight of day d.
-      2. Skip day d if training set has < min_train_days * 24 rows.
-      3. Fit a NaiveMLR on the training set.
-      4. Predict the 24 hours of day d (23 on spring-forward, 25 on fall-back).
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Full dataset with DatetimeIndex, ``'load_mw'``, and ``'temp'``.
-    forecast_start : pd.Timestamp
-        First day to forecast (inclusive).
-    forecast_end : pd.Timestamp
-        Last day to forecast (inclusive).
-    min_train_days : int, optional
-        Minimum training days required before forecasting (default 30).
-    model : NaiveMLR, optional
-        Model template whose ``features``, ``n_lags``, and ``n_mavg_days``
-        settings are reused for every daily refitting.  A plain
-        ``NaiveMLR()`` (default, 281-feature base model) is used if not
-        provided.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns ``['load_mw_actual', 'load_mw_pred']``, DatetimeIndex.
-    """
-    forecast_days = pd.date_range(
-        forecast_start.normalize(), forecast_end.normalize(), freq="D"
-    )
-
-    # Use model settings as a template; create a fresh instance per day
-    if model is None:
-        model_kwargs: Dict = {}
-    else:
-        model_kwargs = dict(
-            features    = model._features,
-            n_lags      = model._n_lags,
-            n_mavg_days = model._n_mavg_days,
-        )
-
-    results = []
-
-    for day in forecast_days:
-        day_ts  = pd.Timestamp(day.date())
-        df_train = df[df.index < day_ts]
-
-        if len(df_train) < min_train_days * 24:
-            continue
-
-        day_end = day_ts + pd.Timedelta(hours=23)
-        df_day  = df.loc[day_ts:day_end]
-        if df_day.empty:
-            continue
-
-        if df_day["temp"].isna().any():
-            warnings.warn(
-                f"NaN temperature on {day_ts.date()}; those hours will be skipped."
-            )
-            df_day = df_day.dropna(subset=["temp"])
-            if df_day.empty:
-                continue
-
-        try:
-            m     = NaiveMLR(**model_kwargs)
-            preds = m.fit_predict(df_train, df_day)
-        except Exception as exc:
-            warnings.warn(f"Forecast failed for {day_ts.date()}: {exc}")
-            continue
-
-        results.append(
-            pd.DataFrame(
-                {"load_mw_actual": df_day["load_mw"], "load_mw_pred": preds}
-            )
-        )
-
-    if not results:
-        return pd.DataFrame(columns=["load_mw_actual", "load_mw_pred"])
-    return pd.concat(results)
 
 
 # ---------------------------------------------------------------------------

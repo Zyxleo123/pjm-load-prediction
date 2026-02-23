@@ -5,40 +5,54 @@ Implements features from two models:
 
   Hong et al. (2011) GLMLF-B naïve MLR benchmark (Equation 16):
       E(Load) = β₀ + β₁·Trend + β₂·Day×Hour + β₃·Month
-              + β₄·Month·T + β₅·Month·T² + β₆·Month·T³
-              + β₇·Hour·T  + β₈·Hour·T²  + β₉·Hour·T³
+              + β₄·Month·W + β₅·Month·W² + β₆·Month·W³
+              + β₇·Hour·W  + β₈·Hour·W²  + β₉·Hour·W³
+      where W is any active weather variable; applied independently to each.
 
   Wang et al. (2016) recency effect extension:
-      Lagged hourly temperatures  T_{t−k},  k = 1 … n_lags
-      Daily moving-average temps  L_{t,d},  d = 1 … n_mavg_days
-          where L_{t,d} = (1/24) Σ_{s=1}^{24d} T_{t−s}
-      Each recency variable U gets the same f(U) treatment as T in the
-      base temperature features (cubic, with month- and hour-dummy
-      interactions):
+      Lagged hourly values  W_{t−k},  k = 1 … n_lags
+      Daily moving-average  L_{t,d},  d = 1 … n_mavg_days
+          where L_{t,d} = (1/24) Σ_{s=1}^{24d} W_{t−s}
+      Each recency variable U gets the same f(U) treatment as W:
           f(U) = U + U² + U³ + U·M + U²·M + U³·M + U·H + U²·H + U³·H
-      yielding 3 + 33 + 69 = 105 columns per variable.
+      yielding 105 columns per weather variable per lag/mavg period.
 
-Default X matrix column layout (281 columns, base features only):
-    [0]        trend
-    [1..11]    M_2 .. M_12            (11 month main-effect dummies, Jan=reference)
-    [12..178]  DH_0_1 .. DH_6_23     (167 Day×Hour interaction dummies)
-    [179..211] M_2_TMP1 .. M_12_TMP3 (33 month × temperature polynomial cols)
-    [212..280] H_1_TMP1 .. H_23_TMP3 (69 hour × temperature polynomial cols)
+Weather column naming (from load.py):
+    Single station : 'temp', 'rh', 'dwpt', 'wspd'
+    Multi-station  : '{station}_temp', '{station}_rh', etc.
+    Temperature columns (plain 'temp' or ending in '_temp') are converted
+    to Fahrenheit before use; all other weather columns are used as-is.
 
-Recency columns appended when temp_lags / temp_mavg is True (105 cols each):
-    Per lag k  (k = 1 … n_lags):
-        lag{k}_TMP1, lag{k}_TMP2, lag{k}_TMP3             (3 raw poly)
-        M_2_lag{k}_TMP1, M_2_lag{k}_TMP2, M_2_lag{k}_TMP3, …   (33 month×poly)
-        H_1_lag{k}_TMP1, H_1_lag{k}_TMP2, H_1_lag{k}_TMP3, …   (69 hour×poly)
-    Per moving-average day d  (d = 1 … n_mavg_days):
-        mavg{d}_TMP1, mavg{d}_TMP2, mavg{d}_TMP3          (3 raw poly)
-        M_2_mavg{d}_TMP1, M_2_mavg{d}_TMP2, M_2_mavg{d}_TMP3, … (33 month×poly)
-        H_1_mavg{d}_TMP1, H_1_mavg{d}_TMP2, H_1_mavg{d}_TMP3, … (69 hour×poly)
+Feature tag convention (used in column names):
+    Column name uppercased, e.g.:
+        'temp'              → 'TEMP'
+        'philadelphia_temp' → 'PHILADELPHIA_TEMP'
+        'rh'                → 'RH'
+
+DEFAULT_FEATURES keys:
+    Feature-group flags:
+        trend                : linear trend index
+        month                : month main-effect dummies (M_2..M_12)
+        day_hour             : day-of-week × hour interaction dummies
+        month_weather        : month dummy × cubic polynomial for each active weather var
+        hour_weather         : hour dummy  × cubic polynomial for each active weather var
+        weather_lags         : lagged hourly weather values (Wang et al. 2016)
+        weather_mavg         : daily moving-average weather values (Wang et al. 2016)
+        weather_interactions : pairwise products of weather vars within the same station
+
+    Per-variable filters (variable part of the column name):
+        temp  : include temperature columns
+        rh    : include relative-humidity columns
+        dwpt  : include dew-point columns
+        wspd  : include wind-speed columns
+    Setting a variable filter to False removes that variable type entirely —
+    no raw features and no interaction features that involve it.
 """
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Optional, Tuple
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -46,13 +60,20 @@ from typing import Dict, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 DEFAULT_FEATURES: Dict[str, bool] = {
-    "trend":      True,   # linear trend index
-    "month":      True,   # month main-effect dummies (M_2..M_12)
-    "day_hour":   True,   # day-of-week × hour interaction dummies
-    "month_temp": True,   # month dummy × temperature polynomial (T, T², T³)
-    "hour_temp":  True,   # hour dummy × temperature polynomial  (T, T², T³)
-    "temp_lags":  False,  # lagged hourly temperatures (Wang et al. 2016)
-    "temp_mavg":  False,  # daily moving-average temperatures (Wang et al. 2016)
+    # Feature-group flags
+    "trend":                True,   # linear trend index
+    "month":                True,   # month main-effect dummies (M_2..M_12)
+    "day_hour":             True,   # day-of-week × hour interaction dummies
+    "month_weather":        True,   # month dummy × weather polynomial for all active weather vars
+    "hour_weather":         True,   # hour dummy  × weather polynomial for all active weather vars
+    "weather_lags":         False,  # lagged hourly weather values (Wang et al. 2016)
+    "weather_mavg":         False,  # daily moving-average weather values (Wang et al. 2016)
+    "weather_interactions": False,  # pairwise within-station weather variable products
+    # Per-variable filters
+    "temp":                 True,   # include temperature columns
+    "rh":                   True,   # include relative-humidity columns
+    "dwpt":                 True,   # include dew-point columns
+    "wspd":                 True,   # include wind-speed columns
 }
 
 
@@ -65,57 +86,94 @@ def celsius_to_fahrenheit(temp_c: pd.Series) -> pd.Series:
     return temp_c * 9.0 / 5.0 + 32.0
 
 
+def _is_temp_col(col: str) -> bool:
+    """True for temperature columns: plain 'temp' or any column ending in '_temp'."""
+    return col == "temp" or col.endswith("_temp")
+
+
+def _var_of(col: str) -> str:
+    """Return the variable-type part of a weather column name.
+
+    Examples
+    --------
+    'philadelphia_temp' → 'temp'
+    'rh'                → 'rh'
+    """
+    return col.rsplit("_", 1)[1] if "_" in col else col
+
+
+def _weather_col_tag(col: str) -> str:
+    """Return the uppercase feature-name tag for a weather column."""
+    return col.upper()
+
+
+def _station_of(col: str) -> str:
+    """Return the station prefix of a weather column.
+
+    Examples
+    --------
+    'philadelphia_temp' → 'philadelphia'
+    'temp'              → ''           (unnamed / single station)
+    """
+    return col.rsplit("_", 1)[0] if "_" in col else ""
+
+
+def _prepare_weather_series(df: pd.DataFrame, col: str) -> pd.Series:
+    """Return the weather series for *col*, converting temperature to Fahrenheit."""
+    s = df[col].astype(float)
+    return celsius_to_fahrenheit(s) if _is_temp_col(col) else s
+
+
 def _recency_poly_features(
-    tmp_f: pd.Series,
+    series: pd.Series,
+    var_tag: str,
     prefix: str,
     month_dummies: pd.DataFrame,
     hour_dummies: pd.DataFrame,
 ) -> Dict[str, pd.Series]:
     """
-    Build the f(U) features for one recency temperature variable (Wang et al. 2016).
+    Build the f(U) features for one recency weather variable (Wang et al. 2016).
 
     Produces 105 columns:
-        3  raw cubic terms (U, U², U³)
-        33 month dummy × cubic  (11 months × 3 degrees)
-        69 hour dummy  × cubic  (23 hours  × 3 degrees)
+        3  raw cubic terms   (U, U², U³)
+        33 month × cubic     (11 months × 3 degrees)
+        69 hour  × cubic     (23 hours  × 3 degrees)
 
     Parameters
     ----------
-    tmp_f : pd.Series
-        Temperature in Fahrenheit (may contain NaN for warm-up rows).
+    series : pd.Series
+        Weather values (may contain NaN for warm-up rows).
+    var_tag : str
+        Uppercase tag, e.g. ``'TEMP'`` or ``'PHILADELPHIA_RH'``.
     prefix : str
-        Column name prefix, e.g. ``'lag1'`` or ``'mavg2'``.
+        Recency prefix, e.g. ``'lag1'`` or ``'mavg2'``.
     month_dummies : pd.DataFrame
-        Columns M_2..M_12 (11 cols, same index as tmp_f).
+        Columns M_2..M_12 (same index as *series*).
     hour_dummies : pd.DataFrame
-        Columns H_1..H_23 (23 cols, same index as tmp_f).
-
-    Returns
-    -------
-    dict mapping column name → pd.Series
+        Columns H_1..H_23 (same index as *series*).
     """
-    tmp_f2 = tmp_f ** 2
-    tmp_f3 = tmp_f ** 3
+    s2 = series ** 2
+    s3 = series ** 3
     parts: Dict[str, pd.Series] = {}
 
-    # Raw cubic polynomial (consistent with base temperature features)
-    parts[f"{prefix}_TMP1"] = tmp_f
-    parts[f"{prefix}_TMP2"] = tmp_f2
-    parts[f"{prefix}_TMP3"] = tmp_f3
+    # Raw cubic polynomial
+    parts[f"{prefix}_{var_tag}1"] = series
+    parts[f"{prefix}_{var_tag}2"] = s2
+    parts[f"{prefix}_{var_tag}3"] = s3
 
-    # Month dummy × polynomial interactions
+    # Month dummy × polynomial
     for col in month_dummies.columns:       # M_2 .. M_12
         d = month_dummies[col].astype(float)
-        parts[f"{col}_{prefix}_TMP1"] = d * tmp_f
-        parts[f"{col}_{prefix}_TMP2"] = d * tmp_f2
-        parts[f"{col}_{prefix}_TMP3"] = d * tmp_f3
+        parts[f"{col}_{prefix}_{var_tag}1"] = d * series
+        parts[f"{col}_{prefix}_{var_tag}2"] = d * s2
+        parts[f"{col}_{prefix}_{var_tag}3"] = d * s3
 
-    # Hour dummy × polynomial interactions
+    # Hour dummy × polynomial
     for col in hour_dummies.columns:        # H_1 .. H_23
         d = hour_dummies[col].astype(float)
-        parts[f"{col}_{prefix}_TMP1"] = d * tmp_f
-        parts[f"{col}_{prefix}_TMP2"] = d * tmp_f2
-        parts[f"{col}_{prefix}_TMP3"] = d * tmp_f3
+        parts[f"{col}_{prefix}_{var_tag}1"] = d * series
+        parts[f"{col}_{prefix}_{var_tag}2"] = d * s2
+        parts[f"{col}_{prefix}_{var_tag}3"] = d * s3
 
     return parts
 
@@ -138,50 +196,27 @@ def build_features(
     ----------
     df : pd.DataFrame
         DataFrame with DatetimeIndex (hourly, naive Eastern time), and columns:
-            ``'load_mw'`` : float, electricity demand in MW
-            ``'temp'``    : float, temperature in degrees Celsius
-        Rows with NaN in ``load_mw`` or ``temp`` are dropped. Additional rows
-        at the start of the series are dropped when recency features are
-        enabled (warm-up rows lacking sufficient history).
+            ``'load_mw'``           : float, electricity demand in MW (required)
+            ``'<station>_<var>'``   : weather variables for one or more stations.
+            Temperature columns (``'temp'`` or ``'*_temp'``) are converted to
+            Fahrenheit; all other weather columns are used as-is.
+        Rows with NaN in any column are dropped.  Additional rows at the start
+        are dropped when recency features are enabled (warm-up period).
     trend_offset : int, optional
         Value such that the trend counter for the i-th row of the cleaned df
         is ``trend_offset + i``.  Pass 0 (default) for training.  For
         prediction, pass the last trend value observed during training so
         that the counter continues without a gap.
     features : dict, optional
-        Mapping of feature-group name → bool controlling which groups are
-        included.  Keys absent from ``DEFAULT_FEATURES`` are silently
-        ignored; keys not supplied fall back to ``DEFAULT_FEATURES``.
-        Available keys:
-
-        +---------------+-----------------------------------------------+
-        | Key           | Description                                   |
-        +===============+===============================================+
-        | ``trend``     | Linear trend index                            |
-        +---------------+-----------------------------------------------+
-        | ``month``     | Month main-effect dummies (M_2..M_12)         |
-        +---------------+-----------------------------------------------+
-        | ``day_hour``  | Day-of-week × hour interaction dummies        |
-        +---------------+-----------------------------------------------+
-        | ``month_temp``| Month dummy × temperature poly (T, T², T³)   |
-        +---------------+-----------------------------------------------+
-        | ``hour_temp`` | Hour dummy  × temperature poly (T, T², T³)   |
-        +---------------+-----------------------------------------------+
-        | ``temp_lags`` | Lagged hourly temps T_{t-k}, k=1..n_lags     |
-        |               | with cubic month/hour interactions             |
-        |               | (Wang et al. 2016)                            |
-        +---------------+-----------------------------------------------+
-        | ``temp_mavg`` | Daily moving-average temps L_{t,d},           |
-        |               | d=1..n_mavg_days, with cubic interactions     |
-        |               | (Wang et al. 2016)                            |
-        +---------------+-----------------------------------------------+
-
+        Mapping of feature-group name → bool.  Keys absent from
+        ``DEFAULT_FEATURES`` are silently ignored; keys not supplied fall
+        back to ``DEFAULT_FEATURES``.
     n_lags : int, optional
-        Number of lagged hourly temperature variables when
-        ``features['temp_lags']`` is True.  Default 12.
+        Number of lagged hourly weather variables when
+        ``features['weather_lags']`` is True.  Default 12.
     n_mavg_days : int, optional
-        Number of daily moving-average temperature variables when
-        ``features['temp_mavg']`` is True.  Default 2.
+        Number of daily moving-average weather variables when
+        ``features['weather_mavg']`` is True.  Default 2.
 
     Returns
     -------
@@ -194,25 +229,32 @@ def build_features(
     Raises
     ------
     ValueError
-        If ``'load_mw'`` or ``'temp'`` columns are missing.
+        If ``'load_mw'`` column is missing.
     """
-    required = {"load_mw", "temp"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"DataFrame is missing required columns: {missing}")
+    if "load_mw" not in df.columns:
+        raise ValueError("DataFrame is missing required column: 'load_mw'")
 
     # Resolve feature flags: start from defaults, overlay user choices
     feat = DEFAULT_FEATURES.copy()
     if features is not None:
         feat.update({k: v for k, v in features.items() if k in DEFAULT_FEATURES})
 
-    # Work on a clean copy; drop rows missing load or temperature
-    df = df[["load_mw", "temp"]].dropna(subset=["load_mw", "temp"])
+    # All weather columns present in df, filtered by per-variable flags.
+    # A column 'philadelphia_temp' is kept only if feat['temp'] is True.
+    weather_cols: List[str] = [
+        c for c in df.columns
+        if c != "load_mw" and feat.get(_var_of(c), True)
+    ]
+
+    # Work on a clean copy; drop rows missing any column
+    all_cols = ["load_mw"] + weather_cols
+    df = df[all_cols].dropna(subset=all_cols)
     n = len(df)
 
-    tmp_f  = celsius_to_fahrenheit(df["temp"])
-    tmp_f2 = tmp_f ** 2
-    tmp_f3 = tmp_f ** 3
+    # Prepare weather series (Fahrenheit for temp cols, raw for others)
+    weather_series: Dict[str, pd.Series] = {
+        col: _prepare_weather_series(df, col) for col in weather_cols
+    }
 
     # ------------------------------------------------------------------
     # 1. Trend
@@ -226,7 +268,7 @@ def build_features(
     # ------------------------------------------------------------------
     # 2. Month main-effect dummies (11 cols, January = reference)
     # ------------------------------------------------------------------
-    month_cat    = pd.Categorical(df.index.month, categories=range(1, 13), ordered=False)
+    month_cat     = pd.Categorical(df.index.month, categories=range(1, 13), ordered=False)
     month_dummies = pd.get_dummies(month_cat, prefix="M", drop_first=True)
     month_dummies.index = df.index
 
@@ -240,61 +282,100 @@ def build_features(
     dh_dummies.index = df.index
 
     # ------------------------------------------------------------------
-    # 4. Hour dummies for base-temperature interactions (H_1..H_23)
+    # 4. Hour dummies for base-weather interactions (H_1..H_23)
     # ------------------------------------------------------------------
-    hour_cat    = pd.Categorical(df.index.hour, categories=range(24), ordered=False)
+    hour_cat     = pd.Categorical(df.index.hour, categories=range(24), ordered=False)
     hour_dummies = pd.get_dummies(hour_cat, prefix="H", drop_first=True)
     hour_dummies.index = df.index
 
     # ------------------------------------------------------------------
-    # 5. Month × temperature polynomial interactions (33 cols)
+    # 5. Month × weather polynomial interactions (33 cols per weather var)
     # ------------------------------------------------------------------
-    month_tmp_parts: Dict[str, pd.Series] = {}
-    for col in month_dummies.columns:           # M_2 .. M_12
-        d = month_dummies[col].astype(float)
-        month_tmp_parts[f"{col}_TMP1"] = d * tmp_f
-        month_tmp_parts[f"{col}_TMP2"] = d * tmp_f2
-        month_tmp_parts[f"{col}_TMP3"] = d * tmp_f3
-    month_tmp_df = pd.DataFrame(month_tmp_parts, index=df.index)
+    month_weather_parts: Dict[str, pd.Series] = {}
+    if feat["month_weather"]:
+        for col in weather_cols:
+            tag = _weather_col_tag(col)
+            s   = weather_series[col]
+            s2  = s ** 2
+            s3  = s ** 3
+            for mcol in month_dummies.columns:      # M_2 .. M_12
+                d = month_dummies[mcol].astype(float)
+                month_weather_parts[f"{mcol}_{tag}1"] = d * s
+                month_weather_parts[f"{mcol}_{tag}2"] = d * s2
+                month_weather_parts[f"{mcol}_{tag}3"] = d * s3
 
     # ------------------------------------------------------------------
-    # 6. Hour × temperature polynomial interactions (69 cols)
+    # 6. Hour × weather polynomial interactions (69 cols per weather var)
     # ------------------------------------------------------------------
-    hour_tmp_parts: Dict[str, pd.Series] = {}
-    for col in hour_dummies.columns:            # H_1 .. H_23
-        d = hour_dummies[col].astype(float)
-        hour_tmp_parts[f"{col}_TMP1"] = d * tmp_f
-        hour_tmp_parts[f"{col}_TMP2"] = d * tmp_f2
-        hour_tmp_parts[f"{col}_TMP3"] = d * tmp_f3
-    hour_tmp_df = pd.DataFrame(hour_tmp_parts, index=df.index)
+    hour_weather_parts: Dict[str, pd.Series] = {}
+    if feat["hour_weather"]:
+        for col in weather_cols:
+            tag = _weather_col_tag(col)
+            s   = weather_series[col]
+            s2  = s ** 2
+            s3  = s ** 3
+            for hcol in hour_dummies.columns:       # H_1 .. H_23
+                d = hour_dummies[hcol].astype(float)
+                hour_weather_parts[f"{hcol}_{tag}1"] = d * s
+                hour_weather_parts[f"{hcol}_{tag}2"] = d * s2
+                hour_weather_parts[f"{hcol}_{tag}3"] = d * s3
 
     # ------------------------------------------------------------------
-    # 7. Lagged hourly temperatures  T_{t-k}  (Wang et al. 2016)
-    #    70 columns per lag: raw (T,T²) + month×(T,T²) + hour×(T,T²)
+    # 7. Lagged weather values  W_{t-k}  (Wang et al. 2016)
+    #    105 columns per weather var per lag k
     # ------------------------------------------------------------------
     lag_parts: Dict[str, pd.Series] = {}
-    if feat["temp_lags"]:
-        for k in range(1, n_lags + 1):
-            tmp_lag = celsius_to_fahrenheit(df["temp"].shift(k))
-            lag_parts.update(
-                _recency_poly_features(tmp_lag, f"lag{k}", month_dummies, hour_dummies)
-            )
+    if feat["weather_lags"]:
+        for col in weather_cols:
+            tag = _weather_col_tag(col)
+            for k in range(1, n_lags + 1):
+                shifted = df[col].shift(k)
+                if _is_temp_col(col):
+                    shifted = celsius_to_fahrenheit(shifted)
+                lag_parts.update(
+                    _recency_poly_features(shifted, tag, f"lag{k}", month_dummies, hour_dummies)
+                )
 
     # ------------------------------------------------------------------
-    # 8. Daily moving-average temperatures  L_{t,d}  (Wang et al. 2016)
-    #    L_{t,d} = (1/24) Σ_{s=1}^{24d} T_{t-s}   (Equation 3)
-    #    70 columns per day: raw (T,T²) + month×(T,T²) + hour×(T,T²)
+    # 8. Daily moving-average weather values  L_{t,d}  (Wang et al. 2016)
+    #    L_{t,d} = (1/24) Σ_{s=1}^{24d} W_{t-s}   (Equation 3)
+    #    105 columns per weather var per mavg day d
     # ------------------------------------------------------------------
     mavg_parts: Dict[str, pd.Series] = {}
-    if feat["temp_mavg"]:
-        for d in range(1, n_mavg_days + 1):
-            window   = 24 * d
-            # shift(1) excludes the current hour, rolling gives the mean of
-            # T_{t-1}, T_{t-2}, ..., T_{t-24d}  — matches Equation 3
-            tmp_mavg = celsius_to_fahrenheit(df["temp"].shift(1).rolling(window).mean())
-            mavg_parts.update(
-                _recency_poly_features(tmp_mavg, f"mavg{d}", month_dummies, hour_dummies)
-            )
+    if feat["weather_mavg"]:
+        for col in weather_cols:
+            tag = _weather_col_tag(col)
+            for d in range(1, n_mavg_days + 1):
+                window = 24 * d
+                # shift(1) excludes the current hour; rolling gives the mean of
+                # W_{t-1}, W_{t-2}, ..., W_{t-24d}  — matches Equation 3
+                rolled = df[col].shift(1).rolling(window).mean()
+                if _is_temp_col(col):
+                    rolled = celsius_to_fahrenheit(rolled)
+                mavg_parts.update(
+                    _recency_poly_features(rolled, tag, f"mavg{d}", month_dummies, hour_dummies)
+                )
+
+    # ------------------------------------------------------------------
+    # 9. Pairwise within-station weather interactions
+    #    One column per pair: TAG_A_X_TAG_B  (simple product, no polynomial)
+    #    Only considers active weather_cols (disabled variables already excluded)
+    # ------------------------------------------------------------------
+    interaction_parts: Dict[str, pd.Series] = {}
+    if feat["weather_interactions"]:
+        by_station: Dict[str, List[str]] = defaultdict(list)
+        for col in weather_cols:
+            by_station[_station_of(col)].append(col)
+        for cols_in_station in by_station.values():
+            for i in range(len(cols_in_station)):
+                for j in range(i + 1, len(cols_in_station)):
+                    col_a = cols_in_station[i]
+                    col_b = cols_in_station[j]
+                    tag_a = _weather_col_tag(col_a)
+                    tag_b = _weather_col_tag(col_b)
+                    interaction_parts[f"{tag_a}_X_{tag_b}"] = (
+                        weather_series[col_a] * weather_series[col_b]
+                    )
 
     # ------------------------------------------------------------------
     # Assemble X in canonical order, honouring feature flags
@@ -306,14 +387,16 @@ def build_features(
         parts_list.append(month_dummies)
     if feat["day_hour"]:
         parts_list.append(dh_dummies)
-    if feat["month_temp"]:
-        parts_list.append(month_tmp_df)
-    if feat["hour_temp"]:
-        parts_list.append(hour_tmp_df)
-    if feat["temp_lags"] and lag_parts:
+    if feat["month_weather"] and month_weather_parts:
+        parts_list.append(pd.DataFrame(month_weather_parts, index=df.index))
+    if feat["hour_weather"] and hour_weather_parts:
+        parts_list.append(pd.DataFrame(hour_weather_parts, index=df.index))
+    if feat["weather_lags"] and lag_parts:
         parts_list.append(pd.DataFrame(lag_parts, index=df.index))
-    if feat["temp_mavg"] and mavg_parts:
+    if feat["weather_mavg"] and mavg_parts:
         parts_list.append(pd.DataFrame(mavg_parts, index=df.index))
+    if feat["weather_interactions"] and interaction_parts:
+        parts_list.append(pd.DataFrame(interaction_parts, index=df.index))
 
     X = pd.concat(parts_list, axis=1) if parts_list else pd.DataFrame(index=df.index)
 

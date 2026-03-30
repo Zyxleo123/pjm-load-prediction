@@ -16,31 +16,49 @@ Weather vars   : temp, rh, dwpt, wspd
 
 Usage examples
 --------------
-# All stations, default features (matching DEFAULT_FEATURES in features.py)
+# Default: Center_City only, default features (matching FEATURE_DEFAULTS below)
 python run_experiment.py
 
-# Select specific stations
+# Multiple stations
 python run_experiment.py --stations=PHL,KOP,Levittown
 
 # Toggle features (true/false, case-insensitive)
 python run_experiment.py --weather_lags=true --rh=false --wspd=false
 
-# Combine stations + features + custom output path
-python run_experiment.py --stations=PHL,KOP --weather_lags=true --rh=false --output=results/phl_kop.json
+# Persist artifacts under results/ (off by default; metrics still print to log)
+python run_experiment.py --save-results-json
+python run_experiment.py --save-predictions-csv
+python run_experiment.py --save-results-json --save-predictions-csv
+
+# 95% quantile (one-sided upper bound) + calibration metrics
+python run_experiment.py --quantile=0.95
+
+# Quieter logs, or log every training epoch (quantile mode)
+python run_experiment.py --log-level=WARNING
+python run_experiment.py --quantile=0.95 --qr-log-interval=1
 """
 
+from __future__ import annotations
+
 import argparse
+import datetime
 import json
+import logging
 import os
 import sys
-import datetime
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 
 from features import fit_feature_matrices, predict_feature_matrix
 from load import create_dataset
-from models import compute_metrics
+from models import (
+    NaiveQuantileMLR,
+    compute_metrics,
+    compute_quantile_interval_metrics,
+)
 
 # ---------------------------------------------------------------------------
 # Station registry (from exploration.ipynb)
@@ -57,10 +75,9 @@ PECO_COORDS = {
     "Quakertown":   (40.441, -75.344),
     "Levittown":    (40.155, -74.830),
     "Peach_Bottom": (39.750, -76.224),
-    "Funkytown": (38.750, -76.224),
+    "Funkytown":      (38.750, -76.224),
 }
 
-# Feature flags (matching DEFAULT_FEATURES in features.py)
 FEATURE_FLAGS = [
     "trend", "month", "day_hour",
     "month_weather", "hour_weather",
@@ -68,7 +85,6 @@ FEATURE_FLAGS = [
     "temp", "rh", "dwpt", "wspd",
 ]
 
-# Defaults mirror DEFAULT_FEATURES in features.py
 FEATURE_DEFAULTS = {
     "trend":                True,
     "month":                True,
@@ -91,8 +107,12 @@ SEASONS = {
     "Fall":   [9, 10, 11],
 }
 
+TRAIN_SLICE = "2016", "2022"
+TEST_SLICE = "2023"
+
+
 # ---------------------------------------------------------------------------
-# Argument parsing
+# Argument parsing & logging
 # ---------------------------------------------------------------------------
 
 def _parse_bool(value: str) -> bool:
@@ -110,9 +130,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--stations",
-        default=",".join(PECO_COORDS.keys()),
+        default="Center_City",
         help=(
-            "Comma-separated station names. "
+            "Comma-separated station names (default: Center_City). "
             "Available: " + ", ".join(PECO_COORDS.keys())
         ),
     )
@@ -126,9 +146,389 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--name",
         default=None,
-        help="Output JSON name. Defaults to YYYYMMDD_HHMMSS",
+        help="Output JSON basename (no path). Defaults to YYYYMMDD_HHMMSS",
+    )
+    parser.add_argument(
+        "--save-results-json",
+        action="store_true",
+        help=(
+            "Write results/<name>.json (metrics, config, optional quantile_metrics). "
+            "Default: no JSON file."
+        ),
+    )
+    parser.add_argument(
+        "--save-predictions-csv",
+        action="store_true",
+        help=(
+            "Write results/<name>_predictions.csv (load_mw_pred series). "
+            "Default: no predictions file."
+        ),
+    )
+    parser.add_argument(
+        "--quantile",
+        type=float,
+        default=None,
+        metavar="TAU",
+        help=(
+            "If set (e.g. 0.95), fit linear quantile regression at level TAU "
+            "instead of OLS mean. Reports ECE and sharpness for the one-sided "
+            "upper interval (-inf, q_hat]."
+        ),
+    )
+    parser.add_argument(
+        "--qr-alpha",
+        type=float,
+        default=1e-6,
+        metavar="A",
+        help="L1 penalty on feature weights in torch quantile fit (only with --quantile).",
+    )
+    parser.add_argument(
+        "--qr-lr",
+        type=float,
+        default=0.05,
+        metavar="LR",
+        help="Adam learning rate for torch quantile fit.",
+    )
+    parser.add_argument(
+        "--qr-epochs",
+        type=int,
+        default=400,
+        metavar="N",
+        help="Training epochs (full passes over training rows) for torch quantile fit.",
+    )
+    parser.add_argument(
+        "--qr-batch-size",
+        type=int,
+        default=8192,
+        metavar="B",
+        help="Minibatch size for torch quantile fit.",
+    )
+    parser.add_argument(
+        "--qr-seed",
+        type=int,
+        default=0,
+        metavar="S",
+        help="RNG seed for torch quantile fit.",
+    )
+    parser.add_argument(
+        "--qr-device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Device for torch quantile fit (cuda if available when auto).",
+    )
+    parser.add_argument(
+        "--qr-log-interval",
+        type=int,
+        default=None,
+        metavar="E",
+        help=(
+            "Log torch quantile training every E epochs (default: ~20 progress "
+            "lines per run)."
+        ),
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="Console log verbosity for runtime messages.",
     )
     return parser
+
+
+def _configure_logging(level_name: str) -> None:
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _round_metrics(m: Dict[str, float]) -> Dict[str, float]:
+    return {k: round(v, 4) for k, v in m.items()}
+
+
+def _round_quantile_metrics(m: Dict[str, float]) -> Dict[str, float]:
+    return {k: round(v, 6) for k, v in m.items()}
+
+
+def parse_station_names(stations_arg: str) -> List[str]:
+    return [s.strip() for s in stations_arg.split(",") if s.strip()]
+
+
+def validate_stations(station_names: List[str], log: logging.Logger) -> None:
+    invalid = [s for s in station_names if s not in PECO_COORDS]
+    if invalid:
+        log.error("Unknown station(s): %s", invalid)
+        log.error("Valid options: %s", list(PECO_COORDS.keys()))
+        sys.exit(1)
+    if not station_names:
+        log.error("--stations must not be empty.")
+        sys.exit(1)
+
+
+def feature_dict_from_args(args: argparse.Namespace) -> Dict[str, bool]:
+    return {flag: getattr(args, flag) for flag in FEATURE_FLAGS}
+
+
+def load_or_fetch_dataset(
+    log: logging.Logger,
+    station_names: List[str],
+) -> pd.DataFrame:
+    selected = {name: PECO_COORDS[name] for name in station_names}
+    df_name = "-".join(sorted(station_names))
+    cache_path = os.path.join("data", "full", f"{df_name}.csv")
+    os.makedirs(os.path.join("data", "full"), exist_ok=True)
+
+    t0 = time.perf_counter()
+    if os.path.exists(cache_path):
+        log.info("Loading cached dataset: %s", cache_path)
+        df_loc = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+    else:
+        log.info("Fetching dataset (will be cached for future runs)...")
+        df_loc = create_dataset(
+            "hrl_load_metered_combined.csv", "PE", selected
+        )
+        df_loc.to_csv(cache_path)
+        log.info("Cached to %s", cache_path)
+    log.info(
+        "Dataset load done in %.2fs (%d rows, %d columns)",
+        time.perf_counter() - t0,
+        len(df_loc),
+        len(df_loc.columns),
+    )
+    return df_loc
+
+
+def train_test_split(
+    df_loc: pd.DataFrame,
+    log: logging.Logger,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    df_train = df_loc.loc[TRAIN_SLICE[0] : TRAIN_SLICE[1]]
+    df_test = df_loc.loc[TEST_SLICE]
+    log.info(
+        "Train: %s → %s (%s rows)",
+        df_train.index[0].date(),
+        df_train.index[-1].date(),
+        f"{len(df_train):,}",
+    )
+    log.info(
+        "Test:  %s → %s (%s rows)",
+        df_test.index[0].date(),
+        df_test.index[-1].date(),
+        f"{len(df_test):,}",
+    )
+    return df_train, df_test
+
+
+def _resolve_qr_device(args: argparse.Namespace, log: logging.Logger):
+    import torch
+
+    if args.qr_device == "cpu":
+        return torch.device("cpu")
+    if args.qr_device == "cuda":
+        if not torch.cuda.is_available():
+            log.error("--qr-device=cuda but CUDA is not available.")
+            sys.exit(1)
+        return torch.device("cuda")
+    return None
+
+
+def fit_predict_quantile(
+    args: argparse.Namespace,
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    feature_selection: Dict[str, bool],
+    log: logging.Logger,
+) -> pd.Series:
+    import torch
+
+    if not 0.0 < args.quantile < 1.0:
+        log.error("--quantile must be strictly between 0 and 1.")
+        sys.exit(1)
+
+    qr_device = _resolve_qr_device(args, log)
+    log.info(
+        "Quantile mode τ=%s (PyTorch Adam); building features and fitting...",
+        args.quantile,
+    )
+    model = NaiveQuantileMLR(
+        quantile=args.quantile,
+        features=feature_selection,
+        alpha=args.qr_alpha,
+        learning_rate=args.qr_lr,
+        max_epochs=args.qr_epochs,
+        batch_size=args.qr_batch_size,
+        device=qr_device,
+        seed=args.qr_seed,
+        logger=log,
+        log_interval=args.qr_log_interval,
+    )
+    model.fit(df_train)
+    t0 = time.perf_counter()
+    preds = model.predict(df_test)
+    log.info("Test prediction done in %.2fs", time.perf_counter() - t0)
+    dev_used = (
+        qr_device
+        if qr_device is not None
+        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    log.info("Quantile fit device: %s", dev_used)
+    return preds
+
+
+def fit_predict_ols(
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    feature_selection: Dict[str, bool],
+    log: logging.Logger,
+) -> pd.Series:
+    log.info("OLS mode: building feature matrices and fitting...")
+    t0 = time.perf_counter()
+    X_train, y_train, prep_state = fit_feature_matrices(
+        df_train, features=feature_selection
+    )
+    log.info(
+        "Training features shape %s built in %.2fs",
+        X_train.shape,
+        time.perf_counter() - t0,
+    )
+    t0 = time.perf_counter()
+    X_test = predict_feature_matrix(
+        df_test, prep_state, features=feature_selection
+    )
+    log.info(
+        "Test features shape %s built in %.2fs",
+        X_test.shape,
+        time.perf_counter() - t0,
+    )
+    est = LinearRegression(fit_intercept=True)
+    log.info("Fitting LinearRegression...")
+    t_fit = time.perf_counter()
+    est.fit(X_train.values, y_train.values)
+    log.info("Regression fit done in %.2fs", time.perf_counter() - t_fit)
+    t_pred = time.perf_counter()
+    pred_arr = est.predict(X_test.values)
+    log.info("predict done in %.2fs", time.perf_counter() - t_pred)
+    return pd.Series(pred_arr, index=X_test.index, name="load_mw_pred")
+
+
+def fit_and_predict(
+    args: argparse.Namespace,
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    feature_selection: Dict[str, bool],
+    log: logging.Logger,
+) -> pd.Series:
+    if args.quantile is not None:
+        return fit_predict_quantile(
+            args, df_train, df_test, feature_selection, log
+        )
+    return fit_predict_ols(df_train, df_test, feature_selection, log)
+
+
+def evaluate_predictions(
+    df_test: pd.DataFrame,
+    preds: pd.Series,
+    quantile: Optional[float],
+    log: logging.Logger,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    t0 = time.perf_counter()
+    overall = compute_metrics(df_test["load_mw"], preds)
+    metrics: Dict[str, Any] = {"overall": _round_metrics(overall)}
+
+    for season, months in SEASONS.items():
+        mask = df_test.index.month.isin(months)
+        m = compute_metrics(df_test.loc[mask, "load_mw"], preds[mask])
+        metrics[season] = _round_metrics(m)
+    log.info("Point metrics computed in %.2fs", time.perf_counter() - t0)
+
+    quantile_metrics: Optional[Dict[str, Any]] = None
+    if quantile is not None:
+        q_overall = compute_quantile_interval_metrics(
+            df_test["load_mw"], preds, quantile
+        )
+        quantile_metrics = {"overall": _round_quantile_metrics(q_overall)}
+        for season, months in SEASONS.items():
+            mask = df_test.index.month.isin(months)
+            qm = compute_quantile_interval_metrics(
+                df_test.loc[mask, "load_mw"],
+                preds[mask],
+                quantile,
+            )
+            quantile_metrics[season] = _round_quantile_metrics(qm)
+
+    return metrics, quantile_metrics
+
+
+def log_results_tables(
+    log: logging.Logger,
+    metrics: Dict[str, Any],
+    quantile_metrics: Optional[Dict[str, Any]],
+) -> None:
+    log.info("")
+    log.info("── Results ──────────────────────────────────────────────")
+    for section, vals in metrics.items():
+        log.info(
+            "  %-8s  MAE=%7.1f  RMSE=%7.1f  MAPE=%.3f%%  CVRMSE=%.3f%%",
+            section,
+            vals["MAE"],
+            vals["RMSE"],
+            vals["MAPE"],
+            vals["CVRMSE"],
+        )
+    if quantile_metrics is not None:
+        log.info("── Quantile interval (one-sided upper) ──────────────────")
+        for section, vals in quantile_metrics.items():
+            log.info(
+                "  %-8s  coverage=%.4f  ECE=%.4f  sharpness=%.6f (mean (q-y)/y)",
+                section,
+                vals["coverage"],
+                vals["ece"],
+                vals["sharpness"],
+            )
+
+
+def build_experiment_config(
+    args: argparse.Namespace,
+    station_names: List[str],
+    feature_selection: Dict[str, bool],
+) -> Dict[str, Any]:
+    return {
+        "stations":        station_names,
+        "features":        feature_selection,
+        "train":           f"{TRAIN_SLICE[0]}-{TRAIN_SLICE[1]}",
+        "test":            TEST_SLICE,
+        "quantile":        args.quantile,
+        "qr_alpha":        args.qr_alpha if args.quantile is not None else None,
+        "qr_lr":           args.qr_lr if args.quantile is not None else None,
+        "qr_epochs":       args.qr_epochs if args.quantile is not None else None,
+        "qr_batch_size":   args.qr_batch_size if args.quantile is not None else None,
+        "qr_seed":         args.qr_seed if args.quantile is not None else None,
+        "qr_device":       args.qr_device if args.quantile is not None else None,
+        "qr_log_interval": args.qr_log_interval if args.quantile is not None else None,
+        "log_level":            args.log_level,
+        "save_results_json":    args.save_results_json,
+        "save_predictions_csv": args.save_predictions_csv,
+    }
+
+
+def write_json(path: str, payload: Dict[str, Any]) -> float:
+    t0 = time.perf_counter()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    return time.perf_counter() - t0
+
+
+def write_predictions_csv(path: str, preds: pd.Series) -> None:
+    preds.to_csv(path, header=True)
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -137,123 +537,64 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+    _configure_logging(args.log_level)
+    log = logging.getLogger(__name__)
 
-    # ── Validate stations ─────────────────────────────────────────────────────
-    station_names = [s.strip() for s in args.stations.split(",") if s.strip()]
-    invalid = [s for s in station_names if s not in PECO_COORDS]
-    if invalid:
-        print(f"ERROR: Unknown station(s): {invalid}")
-        print(f"Valid options: {list(PECO_COORDS.keys())}")
-        sys.exit(1)
-    if not station_names:
-        print("ERROR: --stations must not be empty.")
-        sys.exit(1)
+    station_names = parse_station_names(args.stations)
+    validate_stations(station_names, log)
+    feature_selection = feature_dict_from_args(args)
 
-    selected_stations = {name: PECO_COORDS[name] for name in station_names}
-
-    # ── Resolve feature flags ─────────────────────────────────────────────────
-    feature_selection = {flag: getattr(args, flag) for flag in FEATURE_FLAGS}
-
-    # ── Print configuration ───────────────────────────────────────────────────
-    print("=" * 60)
-    print(f"Stations  : {', '.join(station_names)}")
-    print("Features  :")
+    log.info("=" * 60)
+    log.info("Stations: %s", ", ".join(station_names))
+    log.info("Features:")
     for k, v in feature_selection.items():
-        print(f"  {k:25s}: {v}")
-    print("=" * 60)
+        log.info("  %-25s: %s", k, v)
+    log.info("=" * 60)
 
-    # ── Load / cache dataset ──────────────────────────────────────────────────
-    df_name    = "-".join(sorted(station_names))
-    cache_path = os.path.join("data", "full", f"{df_name}.csv")
-    os.makedirs(os.path.join("data", "full"), exist_ok=True)
-
-    if os.path.exists(cache_path):
-        print(f"\nLoading cached dataset: {cache_path}")
-        df_loc = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-    else:
-        print("\nFetching dataset (will be cached for future runs)...")
-        df_loc = create_dataset(
-            "hrl_load_metered_combined.csv", "PE", selected_stations
-        )
-        df_loc.to_csv(cache_path)
-        print(f"Cached to {cache_path}")
-
-    df_train = df_loc.loc["2016":"2022"]
-    df_test  = df_loc.loc["2023"]
-    print(
-        f"Train: {df_train.index[0].date()} → {df_train.index[-1].date()} "
-        f"({len(df_train):,} rows)"
+    df_loc = load_or_fetch_dataset(log, station_names)
+    df_train, df_test = train_test_split(df_loc, log)
+    preds = fit_and_predict(
+        args, df_train, df_test, feature_selection, log
     )
-    print(
-        f"Test : {df_test.index[0].date()} → {df_test.index[-1].date()} "
-        f"({len(df_test):,} rows)"
+    metrics, quantile_metrics = evaluate_predictions(
+        df_test, preds, args.quantile, log
     )
+    log_results_tables(log, metrics, quantile_metrics)
 
-    # ── Features + fit & predict ─────────────────────────────────────────────
-    print("\nBuilding feature matrices and fitting OLS...")
-    X_train, y_train, prep_state = fit_feature_matrices(
-        df_train, features=feature_selection
-    )
-    lr = LinearRegression(fit_intercept=True)
-    lr.fit(X_train.values, y_train.values)
-    X_test = predict_feature_matrix(
-        df_test, prep_state, features=feature_selection
-    )
-    preds = pd.Series(
-        lr.predict(X_test.values),
-        index=X_test.index,
-        name="load_mw_pred",
-    )
-
-    # ── Compute metrics ───────────────────────────────────────────────────────
-    def _round_metrics(m: dict) -> dict:
-        return {k: round(v, 4) for k, v in m.items()}
-
-    overall = compute_metrics(df_test["load_mw"], preds)
-    metrics: dict = {"overall": _round_metrics(overall)}
-
-    for season, months in SEASONS.items():
-        mask = df_test.index.month.isin(months)
-        m = compute_metrics(df_test.loc[mask, "load_mw"], preds[mask])
-        metrics[season] = _round_metrics(m)
-
-    # ── Print summary ─────────────────────────────────────────────────────────
-    print("\n── Results ──────────────────────────────────────────────")
-    for section, vals in metrics.items():
-        print(
-            f"  {section:8s}  MAE={vals['MAE']:7.1f}  RMSE={vals['RMSE']:7.1f}  "
-            f"MAPE={vals['MAPE']:.3f}%  CVRMSE={vals['CVRMSE']:.3f}%"
-        )
-
-    # ── Save JSON ─────────────────────────────────────────────────────────────
-    result = {
+    result: Dict[str, Any] = {
         "timestamp": datetime.datetime.now().isoformat(),
-        "config": {
-            "stations":  station_names,
-            "features":  feature_selection,
-            "train":     "2016-2022",
-            "test":      "2023",
-        },
+        "config": build_experiment_config(args, station_names, feature_selection),
         "metrics": metrics,
     }
+    if quantile_metrics is not None:
+        result["quantile_metrics"] = quantile_metrics
 
-    if args.name is None:
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.name = ts
-
-    out_dir = 'results'
-    if out_dir:
+    out_name = args.name or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = "results"
+    if args.save_results_json or args.save_predictions_csv:
         os.makedirs(out_dir, exist_ok=True)
+    artifact_base = os.path.join(out_dir, out_name)
 
-    output_path = os.path.join(out_dir, f"{args.name}.json") if out_dir else f"{args.name}.json"
-    with open(output_path, "w") as f:
-        json.dump(result, f, indent=2)
+    if args.save_results_json:
+        json_path = f"{artifact_base}.json"
+        json_s = write_json(json_path, result)
+        log.info("Wrote JSON in %.2fs — %s", json_s, json_path)
+    elif args.save_predictions_csv:
+        log.info(
+            "Results JSON skipped (use --save-results-json to write metrics bundle)"
+        )
 
-    pred_path = os.path.splitext(output_path)[0] + "_predictions.csv"
-    preds.to_csv(pred_path, header=True)
+    if args.save_predictions_csv:
+        pred_path = f"{artifact_base}_predictions.csv"
+        write_predictions_csv(pred_path, preds)
+        log.info("Wrote predictions CSV — %s", pred_path)
+    elif args.save_results_json:
+        log.info(
+            "Predictions CSV skipped (use --save-predictions-csv to write series)"
+        )
 
-    print(f"\nSaved to:      {output_path}")
-    print(f"Predictions:   {pred_path}")
+    if not args.save_results_json and not args.save_predictions_csv:
+        log.info("No files written under %s/; see log above for metrics.", out_dir)
 
 
 if __name__ == "__main__":

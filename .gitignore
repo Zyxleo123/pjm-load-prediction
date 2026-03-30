@@ -1,3 +1,5 @@
 *.pyc
 *.sqlite
+*.json
+*.csv
 hrl_load_metered_combined.csv

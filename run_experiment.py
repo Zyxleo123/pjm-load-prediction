@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run_experiment.py — Run a NaiveMLR load-forecasting experiment with
+run_experiment.py — Load-forecasting experiment (OLS on engineered features) with
                     configurable feature flags and weather station selection.
 
 Stations (from exploration.ipynb)
@@ -36,9 +36,11 @@ import sys
 import datetime
 
 import pandas as pd
+from sklearn.linear_model import LinearRegression
 
+from features import fit_feature_matrices, predict_feature_matrix
 from load import create_dataset
-from models import NaiveMLR, compute_metrics
+from models import compute_metrics
 
 # ---------------------------------------------------------------------------
 # Station registry (from exploration.ipynb)
@@ -55,6 +57,7 @@ PECO_COORDS = {
     "Quakertown":   (40.441, -75.344),
     "Levittown":    (40.155, -74.830),
     "Peach_Bottom": (39.750, -76.224),
+    "Funkytown": (38.750, -76.224),
 }
 
 # Feature flags (matching DEFAULT_FEATURES in features.py)
@@ -73,12 +76,12 @@ FEATURE_DEFAULTS = {
     "month_weather":        True,
     "hour_weather":         True,
     "weather_lags":         False,
-    "weather_mavg":         False,
+    "weather_mavg":         True,
     "weather_interactions": False,
     "temp":                 True,
-    "rh":                   True,
+    "rh":                   False,
     "dwpt":                 True,
-    "wspd":                 True,
+    "wspd":                 False,
 }
 
 SEASONS = {
@@ -102,7 +105,7 @@ def _parse_bool(value: str) -> bool:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run NaiveMLR experiment with selectable stations and features.",
+        description="Run OLS load forecast with selectable stations and features.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -121,9 +124,9 @@ def _build_parser() -> argparse.ArgumentParser:
             metavar="BOOL",
         )
     parser.add_argument(
-        "--output",
+        "--name",
         default=None,
-        help="Output JSON path. Defaults to results/YYYYMMDD_HHMMSS.json",
+        help="Output JSON name. Defaults to YYYYMMDD_HHMMSS",
     )
     return parser
 
@@ -186,10 +189,21 @@ def main() -> None:
         f"({len(df_test):,} rows)"
     )
 
-    # ── Fit & predict ─────────────────────────────────────────────────────────
-    print("\nFitting model...")
-    model = NaiveMLR(features=feature_selection)
-    preds = model.fit_predict(df_train, df_test)
+    # ── Features + fit & predict ─────────────────────────────────────────────
+    print("\nBuilding feature matrices and fitting OLS...")
+    X_train, y_train, prep_state = fit_feature_matrices(
+        df_train, features=feature_selection
+    )
+    lr = LinearRegression(fit_intercept=True)
+    lr.fit(X_train.values, y_train.values)
+    X_test = predict_feature_matrix(
+        df_test, prep_state, features=feature_selection
+    )
+    preds = pd.Series(
+        lr.predict(X_test.values),
+        index=X_test.index,
+        name="load_mw_pred",
+    )
 
     # ── Compute metrics ───────────────────────────────────────────────────────
     def _round_metrics(m: dict) -> dict:
@@ -223,19 +237,23 @@ def main() -> None:
         "metrics": metrics,
     }
 
-    if args.output is None:
-        os.makedirs("results", exist_ok=True)
+    if args.name is None:
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output = os.path.join("results", f"{ts}.json")
+        args.name = ts
 
-    out_dir = os.path.dirname(args.output)
+    out_dir = 'results'
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    with open(args.output, "w") as f:
+    output_path = os.path.join(out_dir, f"{args.name}.json") if out_dir else f"{args.name}.json"
+    with open(output_path, "w") as f:
         json.dump(result, f, indent=2)
 
-    print(f"\nSaved to: {args.output}")
+    pred_path = os.path.splitext(output_path)[0] + "_predictions.csv"
+    preds.to_csv(pred_path, header=True)
+
+    print(f"\nSaved to:      {output_path}")
+    print(f"Predictions:   {pred_path}")
 
 
 if __name__ == "__main__":

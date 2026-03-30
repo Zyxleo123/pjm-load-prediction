@@ -15,7 +15,6 @@ LON = -75.60
 
 CURRENT_YEAR = None
 CURRENT_DF = None
-CURRENT_WEATHER_SOURCE = None
 
 # --- Utility: Directory Setup & Save ---
 def save_plot(fig, plot_name, year_label):
@@ -54,27 +53,25 @@ def _load_pjm_data(year_label, zone='PE'):
     CURRENT_DF = df
     return df, year_label
 
-def _load_dataset_with_weather(year_label, zone='PE', lat=LAT, lon=LON, weather_source='openmeteo'):
-    """Loads PJM + weather data for a given year label (int/str)."""
+def _load_dataset_with_weather(year_label, zone='PE', lat=LAT, lon=LON):
+    """Loads PJM + Open-Meteo weather for a given year label (int/str)."""
     global CURRENT_YEAR
     global CURRENT_DF
-    global CURRENT_WEATHER_SOURCE
 
     if not isinstance(year_label, (int, str)):
         raise TypeError("year_label must be an int or str")
 
     year_label = str(year_label)
-    if CURRENT_YEAR == year_label and CURRENT_DF is not None and CURRENT_WEATHER_SOURCE == weather_source:
+    if CURRENT_YEAR == year_label and CURRENT_DF is not None:
         return CURRENT_DF, year_label
 
     if year_label == "combined":
         filepath = "hrl_load_metered_combined.csv"
     else:
         filepath = f"hrl_load_metered_{year_label}.csv"
-    df = create_dataset(filepath, zone, lat, lon, weather_source=weather_source)
+    df = create_dataset(filepath, zone, (lat, lon))
     CURRENT_YEAR = year_label
     CURRENT_DF = df
-    CURRENT_WEATHER_SOURCE = weather_source
     return df, year_label
 
 # --- Plot Function 1: Basic Time Series ---

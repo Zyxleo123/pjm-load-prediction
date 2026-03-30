@@ -12,31 +12,33 @@ References:
     International Journal of Forecasting.
 """
 
-import warnings
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 from typing import Dict, Optional
 
-from features import DEFAULT_FEATURES, build_features
+from features import (
+    ForecastPrepState,
+    fit_feature_matrices,
+    predict_feature_matrix,
+)
 
 
 class NaiveMLR:
     """
     GLMLF-B: Naïve MLR benchmark for short-term load forecasting.
 
-    Wraps sklearn LinearRegression with the feature engineering from
-    ``features.build_features()``.  When recency features are enabled
-    (``features['weather_lags']`` or ``features['weather_mavg']``), the model
-    automatically stores the tail of the training data and prepends it when
-    predicting, so that lag/moving-average features can be computed for all
-    test rows without a warm-up gap.
+    Wraps sklearn LinearRegression with feature matrices from
+    ``features.fit_feature_matrices`` / ``features.predict_feature_matrix``.
+    When recency features are enabled, the model stores a training tail and
+    prepends it for prediction so lag/moving-average features are defined on
+    the first test hour.
 
     Parameters
     ----------
     features : dict, optional
-        Feature group → bool mapping passed to ``build_features()``.
-        Missing keys fall back to ``DEFAULT_FEATURES``.  Example::
+        Feature group → bool; merged with ``DEFAULT_FEATURES`` in
+        ``features.build_features``.  Example::
 
             NaiveMLR(features={"weather_lags": True, "weather_mavg": True})
 
@@ -71,36 +73,7 @@ class NaiveMLR:
         self._lr: Optional[LinearRegression] = None
         self.feature_names_: Optional[list]  = None
         self.n_train_rows_: int = 0
-
-        # Last trend value seen during fit(); used as trend_offset in predict()
-        # so the test-set trend continues without a gap.
-        self._trend_end: int = 0
-
-        # Tail of training data kept for recency-feature warm-up in predict()
-        self._train_tail: Optional[pd.DataFrame] = None
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _needs_history(self) -> bool:
-        """True when the resolved feature set includes any recency features."""
-        if self.feature_names_ is None:
-            return False
-        return any(
-            c.startswith("lag") or c.startswith("mavg")
-            for c in self.feature_names_
-        )
-
-    def _lookback_rows(self) -> int:
-        """Number of historical rows required before the first test row."""
-        feat = DEFAULT_FEATURES.copy()
-        if self._features is not None:
-            feat.update({k: v for k, v in self._features.items()
-                         if k in DEFAULT_FEATURES})
-        lags_rows = self._n_lags if feat["weather_lags"] else 0
-        mavg_rows = (24 * self._n_mavg_days + 1) if feat["weather_mavg"] else 0
-        return max(lags_rows, mavg_rows)
+        self._prep_state: Optional[ForecastPrepState] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -120,26 +93,16 @@ class NaiveMLR:
         -------
         self
         """
-        X, y = build_features(
+        X, y, self._prep_state = fit_feature_matrices(
             df_train,
-            trend_offset=0,
             features=self._features,
             n_lags=self._n_lags,
             n_mavg_days=self._n_mavg_days,
         )
         self._lr = LinearRegression(fit_intercept=True)
         self._lr.fit(X.values, y.values)
-        self.feature_names_ = list(X.columns)
+        self.feature_names_ = list(self._prep_state.feature_names)
         self.n_train_rows_  = len(X)
-        self._trend_end     = int(X["trend"].iloc[-1]) if "trend" in X.columns else len(X)
-
-        # Store training tail for recency warm-up during predict()
-        lookback = self._lookback_rows()
-        if lookback > 0:
-            weather_cols = [c for c in df_train.columns if c != "load_mw"]
-            keep_cols = ["load_mw"] + weather_cols
-            self._train_tail = df_train[keep_cols].tail(lookback).copy()
-
         return self
 
     def predict(
@@ -165,53 +128,17 @@ class NaiveMLR:
         pd.Series
             Predicted load in MW, named ``'load_mw_pred'``.
         """
-        if self._lr is None:
+        if self._lr is None or self._prep_state is None:
             raise RuntimeError("Call fit() before predict().")
 
-        if trend_offset is None:
-            trend_offset = self._trend_end
-
-        # Inject placeholder load_mw if absent (not needed for prediction)
-        df_pred = df_test.copy()
-        if "load_mw" not in df_pred.columns:
-            df_pred["load_mw"] = 0.0
-
-        if self._needs_history() and self._train_tail is not None:
-            # Prepend training tail so lag/rolling features can be computed
-            # for all test rows.  Adjust trend_offset so that the tail rows
-            # absorb the "warm-up" counts and the first test row gets
-            # trend = _trend_end + 1.
-            tail = self._train_tail.copy()
-            tail["load_mw"] = tail.get("load_mw", 0.0)  # ensure column present
-            df_combined = pd.concat([tail, df_pred])
-            combined_offset = self._trend_end - len(tail)
-
-            X_combined, _ = build_features(
-                df_combined,
-                trend_offset=combined_offset,
-                features=self._features,
-                n_lags=self._n_lags,
-                n_mavg_days=self._n_mavg_days,
-            )
-            # Keep only the rows that belong to the original test set
-            test_idx = df_test.index
-            X_test   = X_combined.loc[X_combined.index.isin(test_idx)]
-        else:
-            X_test, _ = build_features(
-                df_pred,
-                trend_offset=trend_offset,
-                features=self._features,
-                n_lags=self._n_lags,
-                n_mavg_days=self._n_mavg_days,
-            )
-
-        if list(X_test.columns) != self.feature_names_:
-            raise ValueError(
-                f"Feature mismatch: expected {len(self.feature_names_)} cols, "
-                f"got {len(X_test.columns)}. Make sure test data covers all "
-                "calendar combinations (use a full-year or multi-year window)."
-            )
-
+        X_test = predict_feature_matrix(
+            df_test,
+            self._prep_state,
+            features=self._features,
+            n_lags=self._n_lags,
+            n_mavg_days=self._n_mavg_days,
+            trend_offset=trend_offset,
+        )
         preds = self._lr.predict(X_test.values)
         return pd.Series(preds, index=X_test.index, name="load_mw_pred")
 
@@ -232,6 +159,89 @@ class NaiveMLR:
 # ---------------------------------------------------------------------------
 # Evaluation metrics
 # ---------------------------------------------------------------------------
+
+def _peak_valley_mapes(
+    actual: pd.Series,
+    predicted: pd.Series,
+) -> Dict[str, float]:
+    """
+    Compute four daily peak/valley MAPE metrics (averaged across all days).
+
+    peak_load_mape
+        MAPE between predicted daily maximum and actual daily maximum.
+        Measures how well the model predicts the magnitude of the peak,
+        regardless of when it occurs.
+
+    valley_load_mape
+        Same but for the daily minimum (valley).
+
+    peak_hour_load_mape
+        For each day, find the hour where the *actual* peak occurs, then
+        compute MAPE between the prediction at that hour and the actual load
+        at that hour.  Measures how well the model predicts the load at the
+        true peak time (even if it predicts a different hour as the peak).
+
+    valley_hour_load_mape
+        Same but at the hour of the actual daily valley.
+
+    Both series must have a DatetimeIndex.
+    """
+    dates = actual.index.date
+    unique_dates = np.unique(dates)
+
+    peak_load_apes:       list = []
+    valley_load_apes:     list = []
+    peak_hour_apes:       list = []
+    valley_hour_apes:     list = []
+
+    for d in unique_dates:
+        mask  = dates == d
+        a_day = actual[mask]
+        p_day = predicted[mask]
+
+        # deduplicate
+        a_day = a_day[~a_day.index.duplicated(keep='first')]
+        p_day = p_day[~p_day.index.duplicated(keep='first')]
+
+        if len(a_day) == 0:
+            continue
+
+        # 1) Peak load: predicted daily max vs actual daily max
+        a_max = float(a_day.max())
+        p_max = float(p_day.max())
+        if a_max != 0:
+            peak_load_apes.append(abs(p_max - a_max) / abs(a_max))
+
+        # 2) Valley load: predicted daily min vs actual daily min
+        a_min = float(a_day.min())
+        p_min = float(p_day.min())
+        if a_min != 0:
+            valley_load_apes.append(abs(p_min - a_min) / abs(a_min))
+
+        # 3) Peak-hour load: at the actual-peak timestamp, pred vs actual
+        peak_ts = a_day.idxmax()
+        a_at_peak = float(a_day[peak_ts])
+        p_at_peak = float(p_day[peak_ts])
+        if a_at_peak != 0:
+            peak_hour_apes.append(abs(p_at_peak - a_at_peak) / abs(a_at_peak))
+
+        # 4) Valley-hour load: at the actual-valley timestamp, pred vs actual
+        valley_ts = a_day.idxmin()
+        a_at_valley = float(a_day[valley_ts])
+        p_at_valley = float(p_day[valley_ts])
+        if a_at_valley != 0:
+            valley_hour_apes.append(abs(p_at_valley - a_at_valley) / abs(a_at_valley))
+
+    def _mean_pct(apes: list) -> float:
+        return float(np.mean(apes) * 100) if apes else float("nan")
+
+    return {
+        "peak_load_mape":        _mean_pct(peak_load_apes),
+        "valley_load_mape":      _mean_pct(valley_load_apes),
+        "peak_hour_load_mape":   _mean_pct(peak_hour_apes),
+        "valley_hour_load_mape": _mean_pct(valley_hour_apes),
+    }
+
 
 def compute_metrics(
     actual: pd.Series,
@@ -254,8 +264,15 @@ def compute_metrics(
     Returns
     -------
     dict
-        Keys: ``'MAE'``, ``'RMSE'``, ``'MAPE'``, ``'CVRMSE'`` (all floats;
-        MAPE and CVRMSE are percentages).
+        When ``groupby`` is None, keys are:
+        ``'MAE'``, ``'RMSE'``, ``'MAPE'``, ``'CVRMSE'`` (all floats;
+        MAPE and CVRMSE are percentages), plus four daily peak/valley MAPE
+        metrics (see :func:`_peak_valley_mapes`):
+        ``'peak_load_mape'``, ``'valley_load_mape'``,
+        ``'peak_hour_load_mape'``, ``'valley_hour_load_mape'``.
+
+        When ``groupby`` is given, returns a dict-of-dicts keyed by group
+        label with only the base metrics (no peak/valley metrics per group).
     """
     actual    = pd.Series(actual,    dtype=float)
     predicted = pd.Series(predicted, dtype=float)
@@ -271,7 +288,9 @@ def compute_metrics(
         return {"MAE": mae, "RMSE": rmse, "MAPE": mape, "CVRMSE": cvrmse}
 
     if groupby is None:
-        return _metrics(actual.values, predicted.values)
+        result = _metrics(actual.values, predicted.values)
+        result.update(_peak_valley_mapes(actual, predicted))
+        return result
 
     group_key = {
         "month":     actual.index.month,
@@ -302,6 +321,8 @@ def evaluate_forecast(results_df: pd.DataFrame) -> Dict[str, float]:
     Returns
     -------
     dict
-        ``{'MAE': ..., 'RMSE': ..., 'MAPE': ..., 'CVRMSE': ...}``
+        ``{'MAE': ..., 'RMSE': ..., 'MAPE': ..., 'CVRMSE': ...,
+           'peak_load_mape': ..., 'valley_load_mape': ...,
+           'peak_hour_load_mape': ..., 'valley_hour_load_mape': ...}``
     """
     return compute_metrics(results_df["load_mw_actual"], results_df["load_mw_pred"])

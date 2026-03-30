@@ -52,6 +52,7 @@ DEFAULT_FEATURES keys:
 import numpy as np
 import pandas as pd
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 
@@ -66,14 +67,15 @@ DEFAULT_FEATURES: Dict[str, bool] = {
     "day_hour":             True,   # day-of-week × hour interaction dummies
     "month_weather":        True,   # month dummy × weather polynomial for all active weather vars
     "hour_weather":         True,   # hour dummy  × weather polynomial for all active weather vars
-    "weather_lags":         False,  # lagged hourly weather values (Wang et al. 2016)
-    "weather_mavg":         False,  # daily moving-average weather values (Wang et al. 2016)
-    "weather_interactions": False,  # pairwise within-station weather variable products
+    "weather_lags":           False,  # lagged hourly weather values (Wang et al. 2016)
+    "weather_mavg":           False,  # daily moving-average weather values (Wang et al. 2016)
+    "weather_interactions":   False,  # pairwise within-station weather variable products
+    "recency_no_interaction": True,  # if True, recency vars get only 3 poly cols (no month/hour interactions)
     # Per-variable filters
     "temp":                 True,   # include temperature columns
-    "rh":                   True,   # include relative-humidity columns
-    "dwpt":                 True,   # include dew-point columns
-    "wspd":                 True,   # include wind-speed columns
+    "rh":                   False,   # include relative-humidity columns
+    "dwpt":                 False,   # include dew-point columns
+    "wspd":                 False,   # include wind-speed columns
 }
 
 
@@ -130,14 +132,18 @@ def _recency_poly_features(
     prefix: str,
     month_dummies: pd.DataFrame,
     hour_dummies: pd.DataFrame,
+    no_interaction: bool = False,
 ) -> Dict[str, pd.Series]:
     """
     Build the f(U) features for one recency weather variable (Wang et al. 2016).
 
-    Produces 105 columns:
+    Produces 105 columns by default (no_interaction=False):
         3  raw cubic terms   (U, U², U³)
         33 month × cubic     (11 months × 3 degrees)
         69 hour  × cubic     (23 hours  × 3 degrees)
+
+    When no_interaction=True, produces only 3 columns (U, U², U³) — no
+    month or hour interaction terms.
 
     Parameters
     ----------
@@ -151,6 +157,9 @@ def _recency_poly_features(
         Columns M_2..M_12 (same index as *series*).
     hour_dummies : pd.DataFrame
         Columns H_1..H_23 (same index as *series*).
+    no_interaction : bool, optional
+        If True, skip month and hour interaction terms and return only the
+        3 raw polynomial columns.  Default False.
     """
     s2 = series ** 2
     s3 = series ** 3
@@ -161,19 +170,20 @@ def _recency_poly_features(
     parts[f"{prefix}_{var_tag}2"] = s2
     parts[f"{prefix}_{var_tag}3"] = s3
 
-    # Month dummy × polynomial
-    for col in month_dummies.columns:       # M_2 .. M_12
-        d = month_dummies[col].astype(float)
-        parts[f"{col}_{prefix}_{var_tag}1"] = d * series
-        parts[f"{col}_{prefix}_{var_tag}2"] = d * s2
-        parts[f"{col}_{prefix}_{var_tag}3"] = d * s3
+    if not no_interaction:
+        # Month dummy × polynomial
+        for col in month_dummies.columns:       # M_2 .. M_12
+            d = month_dummies[col].astype(float)
+            parts[f"{col}_{prefix}_{var_tag}1"] = d * series
+            parts[f"{col}_{prefix}_{var_tag}2"] = d * s2
+            parts[f"{col}_{prefix}_{var_tag}3"] = d * s3
 
-    # Hour dummy × polynomial
-    for col in hour_dummies.columns:        # H_1 .. H_23
-        d = hour_dummies[col].astype(float)
-        parts[f"{col}_{prefix}_{var_tag}1"] = d * series
-        parts[f"{col}_{prefix}_{var_tag}2"] = d * s2
-        parts[f"{col}_{prefix}_{var_tag}3"] = d * s3
+        # Hour dummy × polynomial
+        for col in hour_dummies.columns:        # H_1 .. H_23
+            d = hour_dummies[col].astype(float)
+            parts[f"{col}_{prefix}_{var_tag}1"] = d * series
+            parts[f"{col}_{prefix}_{var_tag}2"] = d * s2
+            parts[f"{col}_{prefix}_{var_tag}3"] = d * s3
 
     return parts
 
@@ -187,7 +197,7 @@ def build_features(
     trend_offset: int = 0,
     features: Optional[Dict[str, bool]] = None,
     n_lags: int = 12,
-    n_mavg_days: int = 2,
+    n_mavg_days: int = 1,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Build the feature matrix for load forecasting.
@@ -324,6 +334,7 @@ def build_features(
     # 7. Lagged weather values  W_{t-k}  (Wang et al. 2016)
     #    105 columns per weather var per lag k
     # ------------------------------------------------------------------
+    no_interaction = feat.get("recency_no_interaction", False)
     lag_parts: Dict[str, pd.Series] = {}
     if feat["weather_lags"]:
         for col in weather_cols:
@@ -333,7 +344,8 @@ def build_features(
                 if _is_temp_col(col):
                     shifted = celsius_to_fahrenheit(shifted)
                 lag_parts.update(
-                    _recency_poly_features(shifted, tag, f"lag{k}", month_dummies, hour_dummies)
+                    _recency_poly_features(shifted, tag, f"lag{k}", month_dummies, hour_dummies,
+                                           no_interaction=no_interaction)
                 )
 
     # ------------------------------------------------------------------
@@ -353,7 +365,8 @@ def build_features(
                 if _is_temp_col(col):
                     rolled = celsius_to_fahrenheit(rolled)
                 mavg_parts.update(
-                    _recency_poly_features(rolled, tag, f"mavg{d}", month_dummies, hour_dummies)
+                    _recency_poly_features(rolled, tag, f"mavg{d}", month_dummies, hour_dummies,
+                                           no_interaction=no_interaction)
                 )
 
     # ------------------------------------------------------------------
@@ -406,3 +419,131 @@ def build_features(
     y = df.loc[valid_mask, "load_mw"]
 
     return X, y
+
+
+# ---------------------------------------------------------------------------
+# Train / predict orchestration (trend continuation + recency warm-up)
+# ---------------------------------------------------------------------------
+
+
+def merge_feature_flags(features: Optional[Dict[str, bool]]) -> Dict[str, bool]:
+    """``DEFAULT_FEATURES`` with optional user overrides (only known keys)."""
+    feat = DEFAULT_FEATURES.copy()
+    if features is not None:
+        feat.update({k: v for k, v in features.items() if k in DEFAULT_FEATURES})
+    return feat
+
+
+def lookback_row_count(
+    features: Optional[Dict[str, bool]],
+    n_lags: int = 12,
+    n_mavg_days: int = 2,
+) -> int:
+    """Rows of training history needed before the first row of a prediction window."""
+    feat = merge_feature_flags(features)
+    lags_rows = n_lags if feat["weather_lags"] else 0
+    mavg_rows = (24 * n_mavg_days + 1) if feat["weather_mavg"] else 0
+    return max(lags_rows, mavg_rows)
+
+
+@dataclass(frozen=True)
+class ForecastPrepState:
+    """Carry-over from training for :func:`predict_feature_matrix`."""
+
+    trend_end: int
+    train_tail: Optional[pd.DataFrame]
+    feature_names: Tuple[str, ...]
+
+
+def fit_feature_matrices(
+    df_train: pd.DataFrame,
+    features: Optional[Dict[str, bool]] = None,
+    n_lags: int = 12,
+    n_mavg_days: int = 2,
+) -> Tuple[pd.DataFrame, pd.Series, ForecastPrepState]:
+    """
+    Build training ``X, y`` and state needed to build aligned test features.
+
+    Handles the same trend and recency warm-up contract as the NaiveMLR benchmark.
+    """
+    X, y = build_features(
+        df_train,
+        trend_offset=0,
+        features=features,
+        n_lags=n_lags,
+        n_mavg_days=n_mavg_days,
+    )
+    trend_end = int(X["trend"].iloc[-1]) if "trend" in X.columns else len(X)
+    lookback = lookback_row_count(features, n_lags, n_mavg_days)
+    train_tail = None
+    if lookback > 0:
+        weather_cols = [c for c in df_train.columns if c != "load_mw"]
+        train_tail = df_train[["load_mw"] + weather_cols].tail(lookback).copy()
+    state = ForecastPrepState(
+        trend_end=trend_end,
+        train_tail=train_tail,
+        feature_names=tuple(X.columns),
+    )
+    return X, y, state
+
+
+def _feature_matrix_has_recency(feature_names: Tuple[str, ...]) -> bool:
+    return any(n.startswith("lag") or n.startswith("mavg") for n in feature_names)
+
+
+def predict_feature_matrix(
+    df_test: pd.DataFrame,
+    state: ForecastPrepState,
+    features: Optional[Dict[str, bool]] = None,
+    n_lags: int = 12,
+    n_mavg_days: int = 2,
+    trend_offset: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Build the test design matrix with the same columns as training.
+
+    Prepends ``state.train_tail`` when recency columns are present so lags/mavg
+    are defined on the first test hour.
+    """
+    if trend_offset is None:
+        trend_offset = state.trend_end
+
+    df_pred = df_test.copy()
+    if "load_mw" not in df_pred.columns:
+        df_pred["load_mw"] = 0.0
+
+    use_history = (
+        state.train_tail is not None
+        and _feature_matrix_has_recency(state.feature_names)
+    )
+
+    if use_history:
+        tail = state.train_tail.copy()
+        tail["load_mw"] = tail.get("load_mw", 0.0)
+        df_combined = pd.concat([tail, df_pred])
+        combined_offset = state.trend_end - len(tail)
+        X_combined, _ = build_features(
+            df_combined,
+            trend_offset=combined_offset,
+            features=features,
+            n_lags=n_lags,
+            n_mavg_days=n_mavg_days,
+        )
+        test_idx = df_test.index
+        X_test = X_combined.loc[X_combined.index.isin(test_idx)]
+    else:
+        X_test, _ = build_features(
+            df_pred,
+            trend_offset=trend_offset,
+            features=features,
+            n_lags=n_lags,
+            n_mavg_days=n_mavg_days,
+        )
+
+    if tuple(X_test.columns) != state.feature_names:
+        raise ValueError(
+            f"Feature mismatch: expected {len(state.feature_names)} cols, "
+            f"got {len(X_test.columns)}. Make sure test data covers all "
+            "calendar combinations (use a full-year or multi-year window)."
+        )
+    return X_test

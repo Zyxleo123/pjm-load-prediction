@@ -1,169 +1,195 @@
-import pandas as pd
+"""
+Load PJM hourly load from CSV and align Open-Meteo (ERA5 archive) weather.
+
+``locations`` for ``create_dataset`` can be:
+  * dict mapping station name -> (lat, lon) — columns get ``{name}_temp`` etc.
+  * (lat, lon) tuple — single site, columns stay ``temp``, ``rh``, …
+  * lat, lon as 3rd and 4th positional args (legacy) — same as a single tuple.
+"""
+
+from __future__ import annotations
+
 import os
-from datetime import datetime, timedelta
-from meteostat import Point, Hourly
+from typing import List, Mapping, Tuple, Union
+
 import openmeteo_requests
+import pandas as pd
 import requests_cache
 from retry_requests import retry
 
 DATA_ROOT = "data"
+RAW_SUBDIR = "raw"
 
-def load_pjm_csv(filepath, target_zone='PE'):
+LocationDict = Mapping[str, Tuple[float, float]]
+LocationSpec = Union[LocationDict, Tuple[float, float]]
+
+_openmeteo_client: openmeteo_requests.Client | None = None
+
+
+def raw_csv_path(filename: str) -> str:
+    return os.path.join(DATA_ROOT, RAW_SUBDIR, filename)
+
+
+def _get_openmeteo_client() -> openmeteo_requests.Client:
+    global _openmeteo_client
+    if _openmeteo_client is None:
+        cache_session = requests_cache.CachedSession(".cache", expire_after=3600)
+        retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+        _openmeteo_client = openmeteo_requests.Client(session=retry_session)
+    return _openmeteo_client
+
+
+def _eastern_naive_index(utc_index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """UTC-aware index -> US/Eastern wall time, timezone-naive (matches PJM CSV)."""
+    return utc_index.tz_convert("US/Eastern").tz_localize(None)
+
+
+def _station_prefix(name: str) -> str:
+    return name.lower().replace(" ", "_")
+
+
+def _location_jobs(
+    locations: LocationSpec | float, lon: float | None = None
+) -> List[Tuple[str, float, float]]:
     """
-    Reads the raw PJM CSV, filters for a specific zone, and cleans timestamps.
+    Return [(column_prefix, lat, lon), ...]. Empty prefix means do not add a column prefix.
     """
+    if lon is not None:
+        return [("", float(locations), float(lon))]
+
+    if isinstance(locations, dict):
+        jobs: List[Tuple[str, float, float]] = []
+        for name, latlon in locations.items():
+            lat, lo = latlon
+            prefix = _station_prefix(name) if name else ""
+            jobs.append((prefix, float(lat), float(lo)))
+        return jobs
+
+    if (
+        isinstance(locations, tuple)
+        and len(locations) == 2
+        and all(isinstance(x, (int, float)) for x in locations)
+    ):
+        lat, lo = locations
+        return [("", float(lat), float(lo))]
+
+    raise TypeError(
+        "locations must be dict[name -> (lat, lon)], a (lat, lon) tuple, "
+        "or pass lat and lon as the third and fourth arguments"
+    )
+
+
+def _apply_station_prefix(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    if not prefix:
+        return df
+    return df.add_prefix(f"{prefix}_")
+
+
+def join_weather_frames(frames: List[pd.DataFrame]) -> pd.DataFrame:
+    if not frames:
+        raise ValueError("join_weather_frames: no frames")
+    out = frames[0]
+    for f in frames[1:]:
+        out = out.join(f, how="inner")
+    return out
+
+
+def load_pjm_csv(filepath: str, target_zone: str = "PE") -> pd.DataFrame:
+    """Read raw PJM CSV, filter zone, aggregate to hourly zone total load."""
     print(f"Loading PJM data from {filepath}...")
-    
-    # Load the CSV
-    df = pd.read_csv(os.path.join(DATA_ROOT, 'raw', filepath))
-    
-    # 1. Filter for the specific Zone (The "Pipe Owner")
-    if 'zone' in df.columns:
-        df = df[df['zone'] == target_zone].copy()
+
+    df = pd.read_csv(raw_csv_path(filepath))
+
+    if "zone" in df.columns:
+        df = df[df["zone"] == target_zone].copy()
     else:
         print(f"Warning: 'zone' column not found. Available columns: {df.columns}")
-    
-    # 2. Parse Dates
-    # We use 'datetime_beginning_ept' because it aligns with human behavior
-    df['timestamp'] = pd.to_datetime(df['datetime_beginning_ept'])
-    
-    # 3. Aggregate
-    # Sum sub-areas to get Zone total.
-    df_clean = df.groupby('timestamp')['mw'].sum().reset_index()
-    df_clean.rename(columns={'mw': 'load_mw'}, inplace=True)
-    
-    # Set index for merging later
-    df_clean.set_index('timestamp', inplace=True)
-    
+
+    df["timestamp"] = pd.to_datetime(df["datetime_beginning_ept"])
+    df_clean = df.groupby("timestamp")["mw"].sum().reset_index()
+    df_clean.rename(columns={"mw": "load_mw"}, inplace=True)
+    df_clean.set_index("timestamp", inplace=True)
+
     print(f"Loaded {len(df_clean)} rows for Zone: {target_zone}")
     return df_clean
 
-def fetch_noaa_weather(start_date, end_date, lat, lon):
-    """
-    Original Meteostat implementation.
-    """
-    print("Fetching weather data via Meteostat (NOAA)...")
-    
-    location = Point(lat, lon)
-    weather_df = Hourly(location, start_date, end_date)
-    weather_df = weather_df.fetch()
-    
-    # Meteostat returns UTC index. Convert to Eastern Time.
-    weather_df.index = weather_df.index.tz_localize('UTC')
-    weather_df.index = weather_df.index.tz_convert('US/Eastern')
-    weather_df.index = weather_df.index.tz_localize(None)
-    
-    # Select cols
-    cols = ['temp', 'dwpt', 'wspd']
-    available_cols = [c for c in cols if c in weather_df.columns]
-    weather_df = weather_df[available_cols]
-    
-    # Fill gaps
-    weather_df = weather_df.interpolate(method='linear')
-    
-    print(f"Fetched {len(weather_df)} weather rows (Meteostat).")
-    return weather_df
 
-def fetch_openmeteo_weather(start_date, end_date, lat, lon):
-    """
-    New Open-Meteo implementation using Reanalysis (ERA5) data.
-    Guaranteed gap-free data for historical analysis.
-    """
+def fetch_weather(
+    start_date: pd.Timestamp, end_date: pd.Timestamp, lat: float, lon: float
+) -> pd.DataFrame:
+    """Hourly ERA5 archive from Open-Meteo; Eastern-naive index."""
     print("Fetching weather data via Open-Meteo (ERA5 Reanalysis)...")
 
-    # 1. Setup Client
-    cache_session = requests_cache.CachedSession('.cache', expire_after = 3600)
-    retry_session = retry(cache_session, retries = 5, backoff_factor = 0.2)
-    openmeteo = openmeteo_requests.Client(session = retry_session)
-
-    # 2. Prepare API Call
     url = "https://archive-api.open-meteo.com/v1/archive"
-    
-    # Convert Timestamp objects to string "YYYY-MM-DD"
-    start_str = start_date.strftime('%Y-%m-%d')
-    end_str = end_date.strftime('%Y-%m-%d')
-
     params = {
         "latitude": lat,
         "longitude": lon,
-        "start_date": start_str,
-        "end_date": end_str,
-        # Map variables to match Meteostat: Temp, Relative Humidity, Dew Point, Wind Speed
-        "hourly": ["temperature_2m", "relative_humidity_2m",
-                   "dew_point_2m", "wind_speed_10m"],
-        "timezone": "America/New_York" # Handles DST automatically
+        "start_date": start_date.strftime("%Y-%m-%d"),
+        "end_date": end_date.strftime("%Y-%m-%d"),
+        "hourly": [
+            "temperature_2m",
+            "relative_humidity_2m",
+            "dew_point_2m",
+            "wind_speed_10m",
+        ],
+        "timezone": "America/New_York",
     }
 
-    # 3. Fetch Data
-    responses = openmeteo.weather_api(url, params=params)
-    response = responses[0]
-
-    # 4. Process into DataFrame
+    client = _get_openmeteo_client()
+    response = client.weather_api(url, params=params)[0]
     hourly = response.Hourly()
-    
-    # Construct the time index
+
     date_range = pd.date_range(
-        start = pd.to_datetime(hourly.Time(), unit = "s", utc = True),
-        end = pd.to_datetime(hourly.TimeEnd(), unit = "s", utc = True),
-        freq = pd.Timedelta(seconds = hourly.Interval()),
-        inclusive = "left"
+        start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
+        end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
+        freq=pd.Timedelta(seconds=hourly.Interval()),
+        inclusive="left",
     )
 
     hourly_data = {
-        "temp": hourly.Variables(0).ValuesAsNumpy(),       # temperature_2m
-        "rh": hourly.Variables(1).ValuesAsNumpy(),         # relative_humidity_2m
-        "dwpt": hourly.Variables(2).ValuesAsNumpy(),       # dew_point_2m
-        "wspd": hourly.Variables(3).ValuesAsNumpy()        # wind_speed_10m
+        "temp": hourly.Variables(0).ValuesAsNumpy(),
+        "rh": hourly.Variables(1).ValuesAsNumpy(),
+        "dwpt": hourly.Variables(2).ValuesAsNumpy(),
+        "wspd": hourly.Variables(3).ValuesAsNumpy(),
     }
-
-    weather_df = pd.DataFrame(data = hourly_data, index=date_range)
-
-    # 5. Timezone Alignment (Critical Step)
-    # Open-Meteo returns UTC timestamps even if we asked for New_York timezone in the query.
-    # However, the *values* align with the requested timezone logic, but the *index* needs conversion.
-    
-    # Convert UTC index -> Eastern Time
-    weather_df.index = weather_df.index.tz_convert('US/Eastern')
-    
-    # Remove timezone info to match PJM's "naive" timestamp format
-    weather_df.index = weather_df.index.tz_localize(None)
+    weather_df = pd.DataFrame(hourly_data, index=date_range)
+    weather_df.index = _eastern_naive_index(weather_df.index)
 
     print(f"Fetched {len(weather_df)} weather rows (Open-Meteo).")
     return weather_df
 
-def create_dataset(pjm_filepath, target_zone, locations, weather_source='openmeteo'):
-    """
-    Master function to load PJM, load Weather for one or more locations, and join them.
 
-    Args:
-        locations: A list of (name, lat, lon) tuples identifying weather stations.
-                   Example: [("Philadelphia", 39.95, -75.16), ("Harrisburg", 40.27, -76.88)]
-                   Each location's weather columns are prefixed with its name, e.g. "philadelphia_temp".
-        weather_source (str): 'openmeteo' (default) or 'meteostat'
+def create_dataset(
+    pjm_filepath: str,
+    target_zone: str,
+    locations: LocationSpec | float,
+    lon: float | None = None,
+) -> pd.DataFrame:
     """
-    # 1. Load Grid Data
+    Load PJM load, fetch Open-Meteo weather for each site, inner-join on timestamp.
+
+    Parameters
+    ----------
+    locations
+        Mapping ``station_name -> (lat, lon)`` for multi-station (prefixed columns),
+        or ``(lat, lon)`` for a single site (unprefixed ``temp``, …).
+    lon
+        If given, ``locations`` is interpreted as *lat* (legacy 4-arg call).
+    """
     df_load = load_pjm_csv(pjm_filepath, target_zone)
-
     if df_load.empty:
-        raise ValueError(f"No data found for zone {target_zone}. Check your CSV or zone name.")
+        raise ValueError(
+            f"No data found for zone {target_zone}. Check your CSV or zone name."
+        )
 
-    # 2. Determine date range
     start_date = df_load.index.min()
     end_date = df_load.index.max()
 
-    # 3. Load Weather Data for each location and prefix columns
-    fetch_fn = fetch_openmeteo_weather if weather_source == 'openmeteo' else fetch_noaa_weather
+    jobs = _location_jobs(locations, lon)
+    frames = []
+    for prefix, lat, lo in jobs:
+        df_w = fetch_weather(start_date, end_date, lat, lo)
+        frames.append(_apply_station_prefix(df_w, prefix))
 
-    weather_frames = []
-    for name, latlon in locations.items():
-        lat, lon = latlon
-        df_w = fetch_fn(start_date, end_date, lat, lon)
-        prefix = name.lower().replace(" ", "_")
-        df_w = df_w.add_prefix(f"{prefix}_")
-        weather_frames.append(df_w)
-
-    # 4. Merge all weather frames, then join with load
-    df_weather_all = weather_frames[0].join(weather_frames[1:], how='inner') if len(weather_frames) > 1 else weather_frames[0]
-    df_final = df_load.join(df_weather_all, how='inner')
-
-    return df_final
+    df_weather = join_weather_frames(frames)
+    return df_load.join(df_weather, how="inner")

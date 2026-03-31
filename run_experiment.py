@@ -33,6 +33,12 @@ python run_experiment.py --save-results-json --save-predictions-csv
 # 95% quantile (one-sided upper bound) + calibration metrics
 python run_experiment.py --quantile=0.95
 
+# Conformalized QR: offsets from the last training year, per season (spring cal → spring test)
+python run_experiment.py --quantile=0.95 --cqr
+
+# Pool all months in the calibration year (no seasonal stratification)
+python run_experiment.py --quantile=0.95 --cqr --cqr-pooled
+
 # Quieter logs, or log every training epoch (quantile mode)
 python run_experiment.py --log-level=WARNING
 python run_experiment.py --quantile=0.95 --qr-log-interval=1
@@ -56,8 +62,10 @@ from features import fit_feature_matrices, predict_feature_matrix
 from load import create_dataset
 from models import (
     NaiveQuantileMLR,
+    apply_seasonal_cqr_adjustment,
     compute_metrics,
     compute_quantile_interval_metrics,
+    compute_seasonal_cqr_offsets,
 )
 
 # ---------------------------------------------------------------------------
@@ -167,7 +175,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quantile",
         type=float,
-        default=None,
+        default=0.95,
         metavar="TAU",
         help=(
             "If set (e.g. 0.95), fit linear quantile regression at level TAU "
@@ -219,11 +227,61 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--qr-log-interval",
         type=int,
-        default=None,
+        default=1,
         metavar="E",
         help=(
             "Log torch quantile training every E epochs (default: ~20 progress "
             "lines per run)."
+        ),
+    )
+    parser.add_argument(
+        "--cqr",
+        action="store_true",
+        help=(
+            "Conformalize the QR upper bound using the last training year as a "
+            "calibration set (requires --quantile). By default, offsets are "
+            "computed separately per season (same SEASONS as metrics); use "
+            "--cqr-pooled for one global offset."
+        ),
+    )
+    parser.add_argument(
+        "--cqr-cal-year",
+        type=int,
+        default=None,
+        metavar="Y",
+        help=(
+            "Calendar year for CQR calibration (default: last year of TRAIN_SLICE, "
+            "currently the end year of the train range)."
+        ),
+    )
+    parser.add_argument(
+        "--cqr-pooled",
+        action="store_true",
+        help=(
+            "Use a single conformal offset from all calibration-year rows instead "
+            "of per-season offsets."
+        ),
+    )
+    parser.add_argument(
+        "--cqr-min-season-n",
+        type=int,
+        default=24,
+        metavar="N",
+        help=(
+            "Minimum finite calibration scores per season before falling back to "
+            "the pooled offset (only when not --cqr-pooled)."
+        ),
+    )
+    parser.add_argument(
+        "--cqr-offset-quantile",
+        type=float,
+        default=None,
+        metavar="Q",
+        help=(
+            "Quantile rank for calibration residual offsets (default: same as "
+            "--quantile). Use a slightly lower Q (e.g. 0.93 with --quantile=0.95) "
+            "if CQR makes bounds too loose (high coverage / ECE vs target). "
+            "Metrics still compare coverage to --quantile."
         ),
     )
     parser.add_argument(
@@ -324,6 +382,130 @@ def train_test_split(
         f"{len(df_test):,}",
     )
     return df_train, df_test
+
+
+def _default_cqr_cal_year() -> int:
+    """Last calendar year in the fixed train range (calibration slice)."""
+    return int(TRAIN_SLICE[1])
+
+
+def _resolve_cqr_cal_year(args: argparse.Namespace) -> int:
+    if args.cqr_cal_year is not None:
+        return int(args.cqr_cal_year)
+    return _default_cqr_cal_year()
+
+
+def fit_predict_quantile_cqr(
+    args: argparse.Namespace,
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    feature_selection: Dict[str, bool],
+    log: logging.Logger,
+) -> Tuple[pd.Series, Dict[str, Any]]:
+    """
+    Fit QR on the full training window, then conformalize test predictions.
+
+    The QR model is fit on all of ``df_train`` so lag / moving-average features
+    stay continuous into the test year. Conformal scores use only rows from
+    ``cqr_cal_year`` (default: last training year). Per-season offsets map
+    calibration months to the same season at test time.
+    """
+    import torch
+
+    if not 0.0 < args.quantile < 1.0:
+        log.error("--quantile must be strictly between 0 and 1.")
+        sys.exit(1)
+
+    cal_year = _resolve_cqr_cal_year(args)
+    train_years = sorted(set(df_train.index.year))
+    if cal_year not in train_years:
+        log.error(
+            "CQR calibration year %s not in training index years %s",
+            cal_year,
+            train_years,
+        )
+        sys.exit(1)
+
+    df_cal = df_train[df_train.index.year == cal_year]
+    if len(df_cal) == 0:
+        log.error("CQR: no training rows for calibration year %s", cal_year)
+        sys.exit(1)
+
+    oq = args.cqr_offset_quantile
+    if oq is not None and not 0.0 < oq < 1.0:
+        log.error("--cqr-offset-quantile must be strictly between 0 and 1.")
+        sys.exit(1)
+
+    qr_device = _resolve_qr_device(args, log)
+    log.info(
+        "CQR: fit QR τ=%s on full train (%s → %s), calibrate on year %s (%s rows, %s)",
+        args.quantile,
+        df_train.index[0].date(),
+        df_train.index[-1].date(),
+        cal_year,
+        f"{len(df_cal):,}",
+        "pooled" if args.cqr_pooled else "per-season",
+    )
+    if oq is not None and oq != args.quantile:
+        log.info(
+            "CQR residual rank Q=%s (QR fit still targets τ=%s)",
+            oq,
+            args.quantile,
+        )
+
+    model = NaiveQuantileMLR(
+        quantile=args.quantile,
+        features=feature_selection,
+        alpha=args.qr_alpha,
+        learning_rate=args.qr_lr,
+        max_epochs=args.qr_epochs,
+        batch_size=args.qr_batch_size,
+        device=qr_device,
+        seed=args.qr_seed,
+        logger=log,
+        log_interval=args.qr_log_interval,
+    )
+    model.fit(df_train)
+    q_cal = model.predict(df_cal)
+    offsets, detail = compute_seasonal_cqr_offsets(
+        df_cal["load_mw"],
+        q_cal,
+        SEASONS,
+        args.quantile,
+        offset_quantile=oq,
+        pooled=args.cqr_pooled,
+        min_season_n=args.cqr_min_season_n,
+    )
+    if not args.cqr_pooled:
+        for name, eta in offsets.items():
+            log.info("  CQR offset %-8s η = %.4f MW", name, eta)
+    else:
+        log.info("  CQR pooled η = %.4f MW", offsets["__pooled__"])
+
+    t0 = time.perf_counter()
+    q_test = model.predict(df_test)
+    preds = apply_seasonal_cqr_adjustment(
+        q_test,
+        SEASONS,
+        offsets,
+        pooled=args.cqr_pooled,
+    )
+    log.info("CQR test prediction done in %.2fs", time.perf_counter() - t0)
+    dev_used = (
+        qr_device
+        if qr_device is not None
+        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    log.info("Quantile fit device: %s", dev_used)
+
+    meta = {
+        "cal_year": cal_year,
+        "pooled": args.cqr_pooled,
+        "cqr_offset_quantile": oq if oq is not None else args.quantile,
+        "offsets": {k: round(v, 6) for k, v in offsets.items()},
+        "detail": detail,
+    }
+    return preds, meta
 
 
 def _resolve_qr_device(args: argparse.Namespace, log: logging.Logger):
@@ -499,7 +681,7 @@ def build_experiment_config(
     station_names: List[str],
     feature_selection: Dict[str, bool],
 ) -> Dict[str, Any]:
-    return {
+    cfg: Dict[str, Any] = {
         "stations":        station_names,
         "features":        feature_selection,
         "train":           f"{TRAIN_SLICE[0]}-{TRAIN_SLICE[1]}",
@@ -512,10 +694,18 @@ def build_experiment_config(
         "qr_seed":         args.qr_seed if args.quantile is not None else None,
         "qr_device":       args.qr_device if args.quantile is not None else None,
         "qr_log_interval": args.qr_log_interval if args.quantile is not None else None,
+        "cqr":             bool(args.cqr),
+        "cqr_cal_year":    _resolve_cqr_cal_year(args) if args.cqr else None,
+        "cqr_pooled":      bool(args.cqr_pooled) if args.cqr else None,
+        "cqr_min_season_n": args.cqr_min_season_n if args.cqr else None,
+        "cqr_offset_quantile": (
+            args.cqr_offset_quantile if args.cqr else None
+        ),
         "log_level":            args.log_level,
         "save_results_json":    args.save_results_json,
         "save_predictions_csv": args.save_predictions_csv,
     }
+    return cfg
 
 
 def write_json(path: str, payload: Dict[str, Any]) -> float:
@@ -553,9 +743,19 @@ def main() -> None:
 
     df_loc = load_or_fetch_dataset(log, station_names)
     df_train, df_test = train_test_split(df_loc, log)
-    preds = fit_and_predict(
-        args, df_train, df_test, feature_selection, log
-    )
+
+    if args.cqr:
+        if args.quantile is None:
+            log.error("--cqr requires --quantile.")
+            sys.exit(1)
+        preds, cqr_meta = fit_predict_quantile_cqr(
+            args, df_train, df_test, feature_selection, log
+        )
+    else:
+        cqr_meta = None
+        preds = fit_and_predict(
+            args, df_train, df_test, feature_selection, log
+        )
     metrics, quantile_metrics = evaluate_predictions(
         df_test, preds, args.quantile, log
     )
@@ -568,6 +768,8 @@ def main() -> None:
     }
     if quantile_metrics is not None:
         result["quantile_metrics"] = quantile_metrics
+    if cqr_meta is not None:
+        result["cqr"] = cqr_meta
 
     out_name = args.name or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = "results"

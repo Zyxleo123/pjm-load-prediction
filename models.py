@@ -16,7 +16,7 @@ import logging
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
-from typing import Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
     import torch
@@ -569,6 +569,135 @@ def compute_metrics(
         mask = group_key == label
         out[label] = _metrics(actual.values[mask], predicted.values[mask])
     return out
+
+
+def conformal_upper_adjustment(scores: np.ndarray, nominal_quantile: float) -> float:
+    """
+    Additive split-conformal offset for a **one-sided upper** QR bound at level τ.
+
+    Calibration scores are ``s_i = y_i - \\hat{q}(x_i)`` (positive when actual
+    exceeds the raw QR prediction). The adjusted bound is ``\\hat{q}(x) + η``
+    with η the finite-sample τ quantile of ``{s_i}`` (standard ``(n+1)`` rank).
+    """
+    if not 0.0 < nominal_quantile < 1.0:
+        raise ValueError(
+            f"nominal_quantile must be in (0, 1), got {nominal_quantile}"
+        )
+    s = np.asarray(scores, dtype=float)
+    s = s[np.isfinite(s)]
+    n = int(s.size)
+    if n == 0:
+        return 0.0
+    s_sorted = np.sort(s)
+    idx = int(np.ceil((n + 1) * nominal_quantile)) - 1
+    idx = max(0, min(idx, n - 1))
+    return float(s_sorted[idx])
+
+
+def compute_seasonal_cqr_offsets(
+    actual: pd.Series,
+    q_pred: pd.Series,
+    seasons: Mapping[str, List[int]],
+    nominal_quantile: float,
+    *,
+    offset_quantile: Optional[float] = None,
+    pooled: bool = False,
+    min_season_n: int = 24,
+) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    """
+    Conformal offsets for raw upper-quantile predictions.
+
+    When ``pooled`` is False, each season uses only calibration rows whose
+    month falls in that season (e.g. spring test rows use spring calibration
+    scores). Seasons with fewer than ``min_season_n`` finite scores fall back
+    to the pooled (all-index) offset.
+
+    Parameters
+    ----------
+    offset_quantile
+        Quantile level used for the empirical rank of calibration residuals
+        ``y - q_pred`` (finite-sample ``(n+1)`` rank). Defaults to
+        ``nominal_quantile``. Use a **smaller** value (e.g. 0.93 when
+        ``nominal_quantile`` is 0.95) for a **smaller** η and tighter bounds
+        when split conformal is too conservative on your test year.
+
+    Returns
+    -------
+    offsets : dict
+        Maps season name -> η (use ``offsets['__pooled__']`` when ``pooled``).
+    detail : dict
+        Counts and fallback flags for logging / JSON.
+    """
+    oq = float(offset_quantile) if offset_quantile is not None else float(nominal_quantile)
+    if not 0.0 < oq < 1.0:
+        raise ValueError(f"offset_quantile must be in (0, 1), got {oq}")
+    actual = pd.Series(actual, dtype=float)
+    q_pred = pd.Series(q_pred, dtype=float)
+    # Collapse duplicate timestamps in each series first: pd.DataFrame({...})
+    # reindexes and raises if either Series has a non-unique index.
+    actual_u = actual.groupby(level=0, sort=False).mean()
+    q_pred_u = q_pred.groupby(level=0, sort=False).mean()
+    aligned = pd.concat(
+        [actual_u.rename("actual"), q_pred_u.rename("q_pred")],
+        axis=1,
+        join="inner",
+    ).dropna(how="any")
+    residual = aligned["actual"] - aligned["q_pred"]
+    scores = residual.values.astype(float)
+    months_arr = np.asarray(residual.index.month, dtype=int)
+    pooled_eta = conformal_upper_adjustment(scores, oq)
+    detail: Dict[str, Any] = {
+        "pooled": pooled,
+        "pooled_n": int(np.sum(np.isfinite(scores))),
+        "pooled_eta": pooled_eta,
+        "offset_quantile": oq,
+        "per_season": {},
+    }
+    if pooled:
+        return {"__pooled__": pooled_eta}, detail
+
+    offsets: Dict[str, float] = {}
+    for season_name, month_list in seasons.items():
+        mask = np.isin(months_arr, np.asarray(month_list, dtype=int))
+        sub = scores[mask]
+        n_sea = int(np.sum(np.isfinite(sub)))
+        used_fallback = n_sea < min_season_n
+        eta = (
+            pooled_eta
+            if used_fallback
+            else conformal_upper_adjustment(sub, oq)
+        )
+        offsets[season_name] = eta
+        detail["per_season"][season_name] = {
+            "n": n_sea,
+            "eta": eta,
+            "fallback_pooled": used_fallback,
+        }
+    return offsets, detail
+
+
+def apply_seasonal_cqr_adjustment(
+    q_pred: pd.Series,
+    seasons: Mapping[str, List[int]],
+    offsets: Mapping[str, float],
+    *,
+    pooled: bool = False,
+) -> pd.Series:
+    """Add conformal η by calendar season of each row (or global if ``pooled``)."""
+    q_pred = pd.Series(q_pred, dtype=float)
+    if pooled:
+        eta = float(offsets["__pooled__"])
+        return q_pred + eta
+    # invert month -> season for first matching season name (months disjoint)
+    month_to_season: Dict[int, str] = {}
+    for name, mlist in seasons.items():
+        for m in mlist:
+            month_to_season[int(m)] = name
+    etas = np.array(
+        [offsets[month_to_season[int(m)]] for m in q_pred.index.month],
+        dtype=float,
+    )
+    return pd.Series(q_pred.values + etas, index=q_pred.index, name=q_pred.name)
 
 
 def compute_quantile_interval_metrics(

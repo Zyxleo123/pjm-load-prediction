@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
 import numpy as np
 import pandas as pd
 from pandas.tseries.holiday import USFederalHolidayCalendar
@@ -512,30 +513,46 @@ def plot_timeseries_actual_pred_fill(
 def plot_seasonal_failure_rates(
     df: pd.DataFrame,
     ax: Optional[plt.Axes] = None,
-    title: str = "Share of hours with actual > pred (by season)",
+    title: str = "QR tau=0.95: empirical coverage by season",
+    promised_q: float = 0.95,
+    y_pad: float = 0.012,
 ) -> plt.Axes:
+    """
+    Bar chart of seasonal **coverage** ``P(actual <= pred)`` with y-axis
+    zoomed near nominal ``promised_q`` (default 95%) so winter vs other
+    seasons are easy to compare.
+    """
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 4))
     seas = season_for_index(df.index)
-    rates = []
-    labels = []
+    covs: List[float] = []
+    labels: List[str] = []
     for name in SEASONS:
         mask = seas == name
         sub = df.loc[mask]
         if len(sub) == 0:
             continue
-        fail = (sub["load_mw"] > sub["pred"]).mean()
-        rates.append(fail)
+        cov = float((sub["load_mw"] <= sub["pred"]).mean())
+        covs.append(cov)
         labels.append(name)
-    tgt = 1.0 - 0.95
     x = np.arange(len(labels))
-    ax.bar(x, rates, color="slategray", edgecolor="black", alpha=0.85)
-    ax.axhline(tgt, color="crimson", ls="--", label="exact τ=0.95 slack (5%)")
+    ax.bar(x, covs, color="slategray", edgecolor="black", alpha=0.85)
+    ax.axhline(
+        promised_q,
+        color="crimson",
+        ls="--",
+        lw=1.2,
+        label=f"Nominal ({promised_q:.0%})",
+    )
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
-    ax.set_ylabel("Fraction of hours")
+    ax.set_ylabel("Empirical coverage")
     ax.set_title(title)
-    ax.legend()
+    lo = min(covs) - y_pad
+    hi = max(covs) + y_pad
+    ax.set_ylim(lo, hi)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.legend(loc="lower right", fontsize=9)
     ax.grid(axis="y", alpha=0.3)
     return ax
 
@@ -750,7 +767,12 @@ def build_all_figures(
 
     # 4) Seasonal failure histogram
     fig, ax = plt.subplots(figsize=(7, 4))
-    plot_seasonal_failure_rates(qr_df, ax=ax, title="QR: seasonal under-prediction rate")
+    plot_seasonal_failure_rates(
+        qr_df,
+        ax=ax,
+        title="QR tau=0.95: coverage by season (axis zoomed near 95%)",
+        promised_q=promised_q,
+    )
     fig.tight_layout()
     fig.savefig(out_dir / "qr_seasonal_failure_rate.png", dpi=150)
     plt.close(fig)

@@ -36,8 +36,8 @@ from run_experiment import (
 
 DEFAULT_RUNS = {
     "qr_lr5.0": "Plain QR τ=0.95",
-    "cqr_lr5.0_og": "CQR (full winter offset)",
-    "winter0.25": "CQR (winter offset × 0.25)",
+    "cqr_lr5.0_og": "CQR (without tuning)",
+    "winter0.25": "CQR (tuning seasonal offset strength)",
 }
 
 DEFAULT_STATIONS = ["Center_City"]
@@ -685,6 +685,43 @@ def plot_cqr_runs_same_week(
     return ax
 
 
+def plot_qr_vs_cqr_timeseries(
+    qr_aligned: pd.DataFrame,
+    cqr_aligned: pd.DataFrame,
+    *,
+    resample: str = "7D",
+    qr_label: str = "QR (plain, tau=0.95)",
+    cqr_label: str = "CQR (tuning seasonal offset strength)",
+    title: str = "",
+    ax: Optional[plt.Axes] = None,
+) -> plt.Axes:
+    """
+    Actual load plus plain QR bound vs CQR-adjusted bound (e.g. winter0.25).
+    Resampling keeps a full test-year view readable on slides.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(12, 4.5))
+    m = pd.DataFrame(
+        {
+            "actual": qr_aligned["load_mw"],
+            "qr": qr_aligned["pred"],
+            "cqr": cqr_aligned["pred"].reindex(qr_aligned.index),
+        }
+    ).dropna()
+    w = m.resample(resample).mean()
+    ax.plot(w.index, w["actual"], color="black", lw=1.65, label="Actual load")
+    ax.plot(w.index, w["qr"], color="steelblue", lw=1.35, label=qr_label)
+    ax.plot(w.index, w["cqr"], color="darkorange", lw=1.35, label=cqr_label)
+    ax.set_ylabel("MW")
+    ax.set_title(
+        title
+        or f"Plain QR vs CQR winter0.25 — predicted bounds vs actual ({resample} mean)"
+    )
+    ax.legend(loc="upper left", fontsize=9)
+    ax.grid(alpha=0.25)
+    return ax
+
+
 def build_all_figures(
     out_dir: Path,
     results_dir: Path,
@@ -796,6 +833,23 @@ def build_all_figures(
         )
         fig.tight_layout()
         fig.savefig(out_dir / "cqr_pred_comparison_7d.png", dpi=150)
+        plt.close(fig)
+
+    # 5b) Plain QR vs CQR winter0.25 — full test year (7-day mean)
+    w25_csv = results_dir / "winter0.25_predictions.csv"
+    if w25_csv.exists():
+        w25_df = aligned_for("winter0.25")
+        fig, ax = plt.subplots(figsize=(12, 4.5))
+        plot_qr_vs_cqr_timeseries(
+            qr_df,
+            w25_df,
+            resample="7D",
+            title="Plain QR vs CQR (winter0.25): bounds vs actual, 2023 test (7-day mean)",
+            ax=ax,
+        )
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        fig.savefig(out_dir / "qr_vs_cqr_winter025_timeseries.png", dpi=150)
         plt.close(fig)
 
     # 6) Holiday sharpness (QR), separate file

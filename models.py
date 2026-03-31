@@ -682,8 +682,14 @@ def apply_seasonal_cqr_adjustment(
     offsets: Mapping[str, float],
     *,
     pooled: bool = False,
+    season_weights: Optional[Mapping[str, float]] = None,
 ) -> pd.Series:
-    """Add conformal η by calendar season of each row (or global if ``pooled``)."""
+    """
+    Add conformal η by calendar season of each row (or global if ``pooled``).
+
+    If ``season_weights`` is set (non-pooled only), each season's offset is
+    multiplied by that weight before adding (0 = no conformal bump, 1 = full η).
+    """
     q_pred = pd.Series(q_pred, dtype=float)
     if pooled:
         eta = float(offsets["__pooled__"])
@@ -693,8 +699,13 @@ def apply_seasonal_cqr_adjustment(
     for name, mlist in seasons.items():
         for m in mlist:
             month_to_season[int(m)] = name
+    wmap = season_weights or {}
     etas = np.array(
-        [offsets[month_to_season[int(m)]] for m in q_pred.index.month],
+        [
+            float(offsets[month_to_season[int(m)]])
+            * float(wmap.get(month_to_season[int(m)], 1.0))
+            for m in q_pred.index.month
+        ],
         dtype=float,
     )
     return pd.Series(q_pred.values + etas, index=q_pred.index, name=q_pred.name)

@@ -39,6 +39,9 @@ python run_experiment.py --quantile=0.95 --cqr
 # Pool all months in the calibration year (no seasonal stratification)
 python run_experiment.py --quantile=0.95 --cqr --cqr-pooled
 
+# Scale conformal η per season (order: Winter,Spring,Summer,Fall); e.g. only winter:
+python run_experiment.py --quantile=0.95 --cqr --cqr-season-weights=1,0,0,0
+
 # Quieter logs, or log every training epoch (quantile mode)
 python run_experiment.py --log-level=WARNING
 python run_experiment.py --quantile=0.95 --qr-log-interval=1
@@ -50,6 +53,7 @@ import argparse
 import datetime
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -129,6 +133,31 @@ def _parse_bool(value: str) -> bool:
     if value.lower() in ("false", "0", "no"):
         return False
     raise argparse.ArgumentTypeError(f"Expected true/false, got {value!r}")
+
+
+def _parse_cqr_season_weights(value: str) -> Dict[str, float]:
+    """Comma-separated weights in SEASONS key order: Winter,Spring,Summer,Fall."""
+    parts = [p.strip() for p in value.split(",")]
+    keys = list(SEASONS.keys())
+    if len(parts) != len(keys):
+        raise argparse.ArgumentTypeError(
+            f"Expected {len(keys)} comma-separated weights "
+            f"({', '.join(keys)}), got {len(parts)} values."
+        )
+    out: Dict[str, float] = {}
+    for k, p in zip(keys, parts):
+        try:
+            w = float(p)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"Invalid weight for {k!r}: {p!r}"
+            ) from exc
+        if w < 0 or not math.isfinite(w):
+            raise argparse.ArgumentTypeError(
+                f"Weight for {k!r} must be finite and >= 0, got {w}"
+            )
+        out[k] = w
+    return out
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -285,6 +314,19 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--cqr-season-weights",
+        default=None,
+        type=_parse_cqr_season_weights,
+        metavar="W,W,W,W",
+        help=(
+            "Per-season multipliers on conformal offsets η (not compatible with "
+            "--cqr-pooled). Four comma-separated non-negative numbers in calendar "
+            "season order matching SEASONS: Winter,Spring,Summer,Fall. "
+            "0 disables CQR for that season; 1 applies full η; values in (0,1) "
+            "partially shrink the bump (e.g. 0.93,0,0,0 = winter only at 93%% of η)."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -416,6 +458,10 @@ def fit_predict_quantile_cqr(
         log.error("--quantile must be strictly between 0 and 1.")
         sys.exit(1)
 
+    if args.cqr_pooled and args.cqr_season_weights is not None:
+        log.error("--cqr-season-weights is not compatible with --cqr-pooled.")
+        sys.exit(1)
+
     cal_year = _resolve_cqr_cal_year(args)
     train_years = sorted(set(df_train.index.year))
     if cal_year not in train_years:
@@ -476,9 +522,21 @@ def fit_predict_quantile_cqr(
         pooled=args.cqr_pooled,
         min_season_n=args.cqr_min_season_n,
     )
+    sw = args.cqr_season_weights
     if not args.cqr_pooled:
         for name, eta in offsets.items():
-            log.info("  CQR offset %-8s η = %.4f MW", name, eta)
+            w = 1.0 if sw is None else float(sw[name])
+            eff = eta * w
+            if sw is None or w == 1.0:
+                log.info("  CQR offset %-8s η = %.4f MW", name, eta)
+            else:
+                log.info(
+                    "  CQR offset %-8s η = %.4f MW × w=%.4g → %.4f MW",
+                    name,
+                    eta,
+                    w,
+                    eff,
+                )
     else:
         log.info("  CQR pooled η = %.4f MW", offsets["__pooled__"])
 
@@ -489,6 +547,7 @@ def fit_predict_quantile_cqr(
         SEASONS,
         offsets,
         pooled=args.cqr_pooled,
+        season_weights=sw,
     )
     log.info("CQR test prediction done in %.2fs", time.perf_counter() - t0)
     dev_used = (
@@ -498,13 +557,18 @@ def fit_predict_quantile_cqr(
     )
     log.info("Quantile fit device: %s", dev_used)
 
-    meta = {
+    meta: Dict[str, Any] = {
         "cal_year": cal_year,
         "pooled": args.cqr_pooled,
         "cqr_offset_quantile": oq if oq is not None else args.quantile,
         "offsets": {k: round(v, 6) for k, v in offsets.items()},
         "detail": detail,
     }
+    if sw is not None:
+        meta["season_weights"] = {k: round(v, 6) for k, v in sw.items()}
+        meta["effective_offsets"] = {
+            k: round(float(sw[k]) * float(offsets[k]), 6) for k in offsets
+        }
     return preds, meta
 
 
@@ -701,6 +765,11 @@ def build_experiment_config(
         "cqr_offset_quantile": (
             args.cqr_offset_quantile if args.cqr else None
         ),
+        "cqr_season_weights": (
+            {k: round(v, 6) for k, v in args.cqr_season_weights.items()}
+            if args.cqr and args.cqr_season_weights is not None
+            else None
+        ),
         "log_level":            args.log_level,
         "save_results_json":    args.save_results_json,
         "save_predictions_csv": args.save_predictions_csv,
@@ -734,6 +803,10 @@ def main() -> None:
     validate_stations(station_names, log)
     feature_selection = feature_dict_from_args(args)
 
+    if args.cqr_season_weights is not None and not args.cqr:
+        log.error("--cqr-season-weights requires --cqr.")
+        sys.exit(1)
+
     log.info("=" * 60)
     log.info("Stations: %s", ", ".join(station_names))
     log.info("Features:")
@@ -747,6 +820,9 @@ def main() -> None:
     if args.cqr:
         if args.quantile is None:
             log.error("--cqr requires --quantile.")
+            sys.exit(1)
+        if args.cqr_season_weights is not None and args.cqr_pooled:
+            log.error("--cqr-season-weights is not compatible with --cqr-pooled.")
             sys.exit(1)
         preds, cqr_meta = fit_predict_quantile_cqr(
             args, df_train, df_test, feature_selection, log

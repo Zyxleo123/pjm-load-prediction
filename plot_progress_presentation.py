@@ -261,6 +261,124 @@ def find_worst_winter_week(
     return best_chunk, best_score
 
 
+def slice_season_week_near_nominal_coverage(
+    df: pd.DataFrame,
+    *,
+    min_hours: int = 168,
+    target: float = 0.95,
+    margin: float = 0.005,
+    months: Tuple[int, ...],
+    season_label: str = "season",
+) -> Tuple[pd.DataFrame, float, bool]:
+    """
+    Contiguous ``min_hours`` window restricted to ``months`` whose empirical
+    coverage ``mean(actual <= pred)`` is within ``margin`` of ``target`` if
+    any exists; otherwise the window with coverage closest to ``target``.
+
+    Returns
+    -------
+    chunk, coverage, in_band
+        ``in_band`` is True iff ``|coverage - target| <= margin``.
+    """
+    df = df.sort_index()
+    sub = df[df.index.month.isin(months)]
+    best_in_band: Optional[Tuple[pd.DataFrame, float, float]] = None
+    best_dist = float("inf")
+    best_fallback: Optional[Tuple[pd.DataFrame, float, float]] = None
+    best_fb_dist = float("inf")
+
+    for i in range(0, len(sub) - min_hours + 1):
+        chunk = sub.iloc[i : i + min_hours]
+        if not _hourly_contiguous(chunk.index):
+            continue
+        a = chunk["load_mw"].to_numpy(dtype=float)
+        p = chunk["pred"].to_numpy(dtype=float)
+        cov = float(np.mean(a <= p))
+        dist = abs(cov - target)
+        if dist < best_fb_dist:
+            best_fb_dist = dist
+            best_fallback = (chunk, cov, dist)
+        if dist <= margin and dist < best_dist:
+            best_dist = dist
+            best_in_band = (chunk, cov, dist)
+
+    if best_in_band is not None:
+        ch, cov, _ = best_in_band
+        return ch, cov, True
+    if best_fallback is not None:
+        ch, cov, _ = best_fallback
+        return ch, cov, False
+    raise ValueError(
+        f"No contiguous {min_hours}h window found in {season_label} for pred vs actual plot."
+    )
+
+
+def _compact_week_range_label(s0: pd.Timestamp, s1: pd.Timestamp) -> str:
+    if s0.year == s1.year and s0.month == s1.month:
+        return f"{s0.strftime('%b')} {s0.day}–{s1.day}, {s0.year}"
+    if s0.year == s1.year:
+        return f"{s0.strftime('%b %d')} – {s1.strftime('%b %d, %Y')}"
+    return f"{s0.strftime('%b %d, %Y')} – {s1.strftime('%b %d, %Y')}"
+
+
+def plot_qr_pred_vs_actual_scatter(
+    df: pd.DataFrame,
+    *,
+    title: str,
+    note_lines: Optional[List[str]] = None,
+    y_lo: float = 0.0,
+    y_hi: float = 5000.0,
+    ax: Optional[plt.Axes] = None,
+) -> plt.Axes:
+    """
+    Scatter: x = actual load, y = predicted upper bound.
+
+    *x*-limits follow actuals (min–max with padding, floored at 0).
+    *y*-limits default to 0–5000 MW so vertical sharpness is readable.
+    The ``y = x`` segment is clipped to both visible ranges.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(5.5, 5.5))
+    a = df["load_mw"].to_numpy(dtype=float)
+    p = df["pred"].to_numpy(dtype=float)
+    ax.scatter(a, p, s=16, alpha=0.55, c="steelblue", edgecolors="none")
+    amin = float(np.nanmin(a))
+    amax = float(np.nanmax(a))
+    pad = max((amax - amin) * 0.03, 1.0)
+    x_lo = max(0.0, amin - pad)
+    x_hi = amax + pad
+    diag_lo = max(x_lo, y_lo)
+    diag_hi = min(x_hi, y_hi)
+    if diag_lo < diag_hi:
+        ax.plot(
+            [diag_lo, diag_hi],
+            [diag_lo, diag_hi],
+            "k--",
+            lw=1.2,
+            label="y = x",
+        )
+    cov = float(np.mean(a <= p))
+    lines = [f"Share actual ≤ pred: {cov:.1%}  (nominal 95%)"]
+    if note_lines:
+        lines.extend(note_lines)
+    ax.text(
+        0.04,
+        0.97,
+        "\n".join(lines),
+        transform=ax.transAxes,
+        va="top",
+        fontsize=9,
+    )
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(y_lo, y_hi)
+    ax.set_xlabel("Actual load (MW)")
+    ax.set_ylabel("Predicted 95% upper bound (MW)")
+    ax.set_title(title, fontsize=11)
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(alpha=0.3)
+    return ax
+
+
 def mean_upper_sharpness(sub: pd.DataFrame) -> float:
     """Mean (q_pred - actual) / actual; matches ``compute_quantile_interval_metrics``."""
     a = sub["load_mw"].to_numpy(dtype=float)
@@ -565,14 +683,43 @@ def build_all_figures(
     fig.savefig(out_dir / "qr_worst_winter_week.png", dpi=150)
     plt.close(fig)
 
-    # 3) Seasonal failure histogram
+    # 3) QR pred vs actual — spring week with coverage ~95% (±0.5 pp if possible)
+    spring_months = tuple(SEASONS["Spring"])
+    scatter_wk, scatter_cov, scatter_in_band = slice_season_week_near_nominal_coverage(
+        qr_df,
+        target=promised_q,
+        margin=0.005,
+        months=spring_months,
+        season_label="spring (Mar–May)",
+    )
+    s0, s1 = scatter_wk.index[0], scatter_wk.index[-1]
+    week_lbl = _compact_week_range_label(s0, s1)
+    band_line = (
+        f"Coverage in ±0.5pp of {promised_q:.0%}"
+        if scatter_in_band
+        else f"Closest to {promised_q:.0%} in spring (no week in ±0.5pp band)"
+    )
+    fig, ax = plt.subplots(figsize=(5.8, 5.8))
+    plot_qr_pred_vs_actual_scatter(
+        scatter_wk,
+        title="QR 95% bound vs actual (spring week)",
+        note_lines=[week_lbl, band_line],
+        y_lo=0.0,
+        y_hi=5000.0,
+        ax=ax,
+    )
+    fig.tight_layout()
+    fig.savefig(out_dir / "qr_pred_vs_actual_spring_week.png", dpi=150)
+    plt.close(fig)
+
+    # 4) Seasonal failure histogram
     fig, ax = plt.subplots(figsize=(7, 4))
     plot_seasonal_failure_rates(qr_df, ax=ax, title="QR: seasonal under-prediction rate")
     fig.tight_layout()
     fig.savefig(out_dir / "qr_seasonal_failure_rate.png", dpi=150)
     plt.close(fig)
 
-    # 4) CQR vs winter0.25 on the same worst winter week (hourly)
+    # 5) CQR vs winter0.25 on the same worst winter week (hourly)
     cqr_dfs: Dict[str, pd.DataFrame] = {}
     for key in ("cqr_lr5.0_og", "winter0.25"):
         p = results_dir / f"{key}_predictions.csv"
@@ -593,21 +740,21 @@ def build_all_figures(
         fig.savefig(out_dir / "cqr_pred_comparison_7d.png", dpi=150)
         plt.close(fig)
 
-    # 5) Holiday sharpness (QR), separate file
+    # 6) Holiday sharpness (QR), separate file
     fig, ax = plt.subplots(figsize=(6, 4))
     plot_holiday_vs_non_sharpness(qr_df, ax=ax)
     fig.tight_layout()
     fig.savefig(out_dir / "qr_holiday_sharpness.png", dpi=150)
     plt.close(fig)
 
-    # 6) Failure rate by temperature (QR)
+    # 7) Failure rate by temperature (QR)
     fig, ax = plt.subplots(figsize=(8, 4))
     plot_failure_by_temp_bins(qr_df, n_bins=8, ax=ax)
     fig.tight_layout()
     fig.savefig(out_dir / "qr_failure_by_temperature.png", dpi=150)
     plt.close(fig)
 
-    # 7) Sharpness by temperature (QR)
+    # 8) Sharpness by temperature (QR)
     fig, ax = plt.subplots(figsize=(8, 4))
     plot_sharpness_by_temp_bins(qr_df, n_bins=8, ax=ax)
     fig.tight_layout()
@@ -618,6 +765,10 @@ def build_all_figures(
     print(
         f"Worst winter week (QR, mean shortfall {week_score:.2f} MW): "
         f"{t0} → {t1}"
+    )
+    print(
+        f"Spring pred-vs-actual week: {s0} → {s1} "
+        f"(empirical coverage {scatter_cov:.2%}, in ±0.5pp band: {scatter_in_band})"
     )
 
 

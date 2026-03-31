@@ -379,6 +379,36 @@ def plot_qr_pred_vs_actual_scatter(
     return ax
 
 
+def plot_actual_vs_pred_timeseries(
+    df: pd.DataFrame,
+    *,
+    title: str,
+    ax: Optional[plt.Axes] = None,
+) -> plt.Axes:
+    """Hourly actual load and predicted 95% upper bound (line plot only)."""
+    if ax is None:
+        _, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(
+        df.index,
+        df["load_mw"],
+        color="black",
+        lw=1.35,
+        label="Actual load",
+    )
+    ax.plot(
+        df.index,
+        df["pred"],
+        color="steelblue",
+        lw=1.35,
+        label="Pred (95% upper bound)",
+    )
+    ax.set_ylabel("MW")
+    ax.set_title(title, fontsize=11)
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(alpha=0.3)
+    return ax
+
+
 def mean_upper_sharpness(sub: pd.DataFrame) -> float:
     """Mean (q_pred - actual) / actual; matches ``compute_quantile_interval_metrics``."""
     a = sub["load_mw"].to_numpy(dtype=float)
@@ -694,16 +724,11 @@ def build_all_figures(
     )
     s0, s1 = scatter_wk.index[0], scatter_wk.index[-1]
     week_lbl = _compact_week_range_label(s0, s1)
-    band_line = (
-        f"Coverage in ±0.5pp of {promised_q:.0%}"
-        if scatter_in_band
-        else f"Closest to {promised_q:.0%} in spring (no week in ±0.5pp band)"
-    )
     fig, ax = plt.subplots(figsize=(5.8, 5.8))
     plot_qr_pred_vs_actual_scatter(
         scatter_wk,
         title="QR 95% bound vs actual (spring week)",
-        note_lines=[week_lbl, band_line],
+        note_lines=[week_lbl],
         y_lo=0.0,
         y_hi=5000.0,
         ax=ax,
@@ -711,6 +736,17 @@ def build_all_figures(
     fig.tight_layout()
     fig.savefig(out_dir / "qr_pred_vs_actual_spring_week.png", dpi=150)
     plt.close(fig)
+
+    fig_ts, ax_ts = plt.subplots(figsize=(12, 4))
+    plot_actual_vs_pred_timeseries(
+        scatter_wk,
+        title=f"QR: actual vs predicted bound (same week: {week_lbl})",
+        ax=ax_ts,
+    )
+    fig_ts.autofmt_xdate()
+    fig_ts.tight_layout()
+    fig_ts.savefig(out_dir / "qr_spring_week_timeseries.png", dpi=150)
+    plt.close(fig_ts)
 
     # 4) Seasonal failure histogram
     fig, ax = plt.subplots(figsize=(7, 4))

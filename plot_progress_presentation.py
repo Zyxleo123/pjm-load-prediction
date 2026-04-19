@@ -635,6 +635,58 @@ def plot_sharpness_by_temp_bins(
     return ax
 
 
+def ece_upper_quantile_bin(sub: pd.DataFrame, promised_q: float) -> float:
+    """|empirical coverage − τ| for a one-sided upper bound (same as metrics JSON)."""
+    a = sub["load_mw"].to_numpy(dtype=float)
+    p = sub["pred"].to_numpy(dtype=float)
+    ok = np.isfinite(a) & np.isfinite(p)
+    if not np.any(ok):
+        return float("nan")
+    cov = float(np.mean(a[ok] <= p[ok]))
+    return abs(cov - promised_q)
+
+
+def plot_ece_by_temp_bins(
+    df: pd.DataFrame,
+    promised_q: float,
+    n_bins: int = 8,
+    ax: Optional[plt.Axes] = None,
+    title: str = "",
+) -> plt.Axes:
+    """
+    Per temperature bin: ECE = |fraction(actual ≤ pred) − τ|.
+    Uses the same quantile bins as failure / sharpness by temperature.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 4))
+    df2 = assign_temperature_bins(df, n_bins)
+    if df2.empty or "temp_bin" not in df2.columns:
+        ax.text(0.5, 0.5, "No temperature data", ha="center", va="center", transform=ax.transAxes)
+        return ax
+
+    def _ece(s: pd.DataFrame) -> float:
+        return ece_upper_quantile_bin(s, promised_q)
+
+    ece_vals = df2.groupby("temp_bin", observed=True).apply(_ece)
+    centers = _temp_bin_ticklabels(ece_vals.index)
+    ax.bar(
+        range(len(ece_vals)),
+        ece_vals.values,
+        tick_label=centers,
+        color="sienna",
+        alpha=0.85,
+    )
+    ax.set_xlabel("Temperature bin (°C)")
+    ax.set_ylabel("ECE = |coverage − τ|")
+    ax.set_title(
+        title or f"QR: calibration error by temperature (τ={promised_q:g})"
+    )
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=35, ha="right")
+    ax.grid(axis="y", alpha=0.3)
+    ax.axhline(0.0, color="gray", ls=":", lw=1)
+    return ax
+
+
 def plot_run_comparison_timeseries(
     dfs: Mapping[str, pd.DataFrame],
     resample: str = "7D",
@@ -871,6 +923,13 @@ def build_all_figures(
     plot_sharpness_by_temp_bins(qr_df, n_bins=8, ax=ax)
     fig.tight_layout()
     fig.savefig(out_dir / "qr_sharpness_by_temperature.png", dpi=150)
+    plt.close(fig)
+
+    # 9) ECE by temperature (QR)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    plot_ece_by_temp_bins(qr_df, promised_q=promised_q, n_bins=8, ax=ax)
+    fig.tight_layout()
+    fig.savefig(out_dir / "qr_ece_by_temperature.png", dpi=150)
     plt.close(fig)
 
     print(f"Wrote figures under {out_dir.resolve()}")

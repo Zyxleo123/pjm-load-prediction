@@ -204,11 +204,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quantile",
         type=float,
-        default=0.95,
+        default=None,
         metavar="TAU",
         help=(
             "If set (e.g. 0.95), fit linear quantile regression at level TAU "
-            "instead of OLS mean. Reports ECE and sharpness for the one-sided "
+            "instead of OLS mean. Omit this flag for pure OLS (mean forecast). "
+            "With quantile: reports ECE and sharpness for the one-sided "
             "upper interval (-inf, q_hat]."
         ),
     )
